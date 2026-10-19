@@ -2172,8 +2172,11 @@ class HttpDownloadService:
                 status = str(data.get("status") or "").strip().lower()
             except HttpDownloadError as exc:
                 status = str(getattr(exc, "api_status", "") or "").strip().lower()
-                if configured_token or status not in invalid_token_statuses:
+                if status not in invalid_token_statuses:
                     raise
+                if configured_token:
+                    # 配置 token 被拒绝：给出带 status 的可操作报错，而不是原始 HTTP 文案。
+                    raise self._gofile_api_status_error(getattr(exc, "api_status", "")) from exc
                 data = {"status": status}
             if configured_token or status not in invalid_token_statuses:
                 break
@@ -7201,6 +7204,8 @@ class HttpDownloadService:
                             existing.update(row)
                             break
                 if not runtime.get("control_error"):
+                    # 控制通道异常期间不解暂停：unpause 失败会把排队行误标 failed，
+                    # 恢复后这些 gid 已弹出队列、永远停在 paused。
                     await self._maybe_unpause_gofile_downloads(download_files, gofile_paused_gids)
                 google_done = len(google_success_files)
                 google_failed = len(google_failed_rows)
