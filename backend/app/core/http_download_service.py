@@ -225,6 +225,10 @@ class _TransferitDownloadAbort(RuntimeError):
     """内部控制异常：用于从 transferit-py 的同步流式回调里中止下载。"""
 
 
+class HttpDownloadRpcError(HttpDownloadError):
+    """下载器控制通道异常，不代表源站文件传输失败。"""
+
+
 class _GoogleDriveFolderHTMLParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -407,6 +411,9 @@ class Aria2Daemon:
     process: subprocess.Popen
     endpoint: str
     secret: str
+    rpc_failure_since: Optional[float] = None
+    rpc_failure_count: int = 0
+    rpc_last_warning_at: Optional[float] = None
 
 
 @dataclass
@@ -436,7 +443,6 @@ class HttpDownloadService:
         self._pikpak_link_refresh_state: Dict[str, tuple[int, float]] = {}
         self._active_download_tasks: Dict[str, asyncio.Task] = {}
         self._rpc_id = 0
-        self._gofile_guest_token_cache: tuple[str, float] = ("", 0.0)
         self._gofile_guest_token_lock = asyncio.Lock()
         self._google_drive_access_token_cache: tuple[str, float] = ("", 0.0)
         self._google_drive_access_token_lock = asyncio.Lock()
@@ -2012,13 +2018,8 @@ class HttpDownloadService:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     async def _gofile_guest_token(self) -> str:
-        cached_token, expires_at = self._gofile_guest_token_cache
-        if cached_token and expires_at > time.time():
-            return cached_token
+        # 访客会话只属于本次解析，避免并发任务共用过期账号。
         async with self._gofile_guest_token_lock:
-            cached_token, expires_at = self._gofile_guest_token_cache
-            if cached_token and expires_at > time.time():
-                return cached_token
             data = await self._fetch_gofile_json(
                 "https://api.gofile.io/accounts",
                 method="POST",
@@ -2029,7 +2030,6 @@ class HttpDownloadService:
             token = str((data.get("data") or {}).get("token") or "").strip()
             if not token:
                 raise HttpDownloadError("Gofile 未返回访客 token")
-            self._gofile_guest_token_cache = (token, time.time() + 6 * 60 * 60)
             return token
 
     def _gofile_password(self, raw_url: str) -> str:
@@ -2065,7 +2065,7 @@ class HttpDownloadService:
         status_text = str(status or "unknown").strip()
         if status_text.lower() in _GOFILE_NOT_PREMIUM_STATUS:
             return HttpDownloadError(self._gofile_not_premium_message())
-        return HttpDownloadError(f"Gofile 解析失败: {status_text or 'unknown'}")
+        return HttpDownloadError(f"Gofile 解析失败: {status_text or 'unknown'}", api_status=status_text)
 
     def _preview_gofile_download_item(self, source_item: Dict[str, Any], *, target_subdir: str = "", conflict_policy: str = "") -> Dict[str, Any]:
         download_url = str(source_item.get("url") or "").strip()
@@ -2165,7 +2165,24 @@ class HttpDownloadService:
         api_url = f"https://api.gofile.io/contents/{content_id}"
         if params:
             api_url = f"{api_url}?{urlencode(params)}"
-        data = await self._fetch_gofile_contents(api_url, token)
+        invalid_token_statuses = {"error-token", "error-token-invalid", "error-wrongtoken"}
+        for attempt in range(2):
+            try:
+                data = await self._fetch_gofile_contents(api_url, token)
+                status = str(data.get("status") or "").strip().lower()
+            except HttpDownloadError as exc:
+                status = str(getattr(exc, "api_status", "") or "").strip().lower()
+                if configured_token or status not in invalid_token_statuses:
+                    raise
+                data = {"status": status}
+            if configured_token or status not in invalid_token_statuses:
+                break
+            if attempt:
+                raise HttpDownloadError("Gofile 新建的访客 token 仍被拒绝，请检查 Gofile 服务状态及代理出口")
+            # 只更新当前解析的账号；已提交文件继续使用各自的 Cookie。
+            token = await self._gofile_guest_token()
+        if str(data.get("status") or "").strip().lower() != "ok":
+            raise self._gofile_api_status_error(data.get("status"))
         root = data.get("data") or {}
         if not isinstance(root, dict):
             raise HttpDownloadError("Gofile 返回数据结构异常")
@@ -5586,13 +5603,15 @@ class HttpDownloadService:
                 "--allow-overwrite=true",
                 "--auto-file-renaming=false",
                 "--continue=true",
+                # 共用有界写缓存，合并小块写入，避免随任务数放大缓存占用。
+                "--disk-cache=64M",
                 "--summary-interval=0",
                 "--console-log-level=warn",
                 "--dir", self._download_root(),
                 "--input-file", session_file,
                 "--save-session", session_file,
                 "--save-session-interval=30",
-                "--auto-save-interval=1",
+                "--auto-save-interval=30",
             ]
             popen_kwargs = {
                 "stdin": subprocess.DEVNULL,
@@ -5614,6 +5633,11 @@ class HttpDownloadService:
                 try:
                     await self._rpc_call_raw(daemon, "aria2.getVersion", [])
                     self._daemon = daemon
+                    logger.info(
+                        "[HTTP下载诊断] aria2 已就绪 pid=%s 全局并发=%s 写缓存=64MiB "
+                        "断点保存=30秒 会话保存=30秒",
+                        getattr(process, "pid", None), self._aria2_max_concurrent_downloads(),
+                    )
                     return daemon
                 except Exception:
                     await asyncio.sleep(0.1)
@@ -5638,13 +5662,79 @@ class HttpDownloadService:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urlopen(request, timeout=8) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            try:
+                with urlopen(request, timeout=8) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                # 控制接口异常与源站下载异常必须分开，不能仅显示 timed out。
+                reason = self._sanitize_error(exc) or exc.__class__.__name__
+                raise HttpDownloadRpcError(f"本机 aria2 控制接口 {method} 请求失败: {reason}") from exc
             if body.get("error"):
                 raise HttpDownloadError(body["error"].get("message") or "aria2 RPC 调用失败")
             return body.get("result")
 
-        return await asyncio.to_thread(call)
+        started = time.monotonic()
+        try:
+            result = await asyncio.to_thread(call)
+        except HttpDownloadRpcError as exc:
+            now = time.monotonic()
+            if daemon.rpc_failure_since is None:
+                daemon.rpc_failure_since = started
+            daemon.rpc_failure_count += 1
+            if daemon.rpc_failure_count == 1 or daemon.rpc_last_warning_at is None or now - daemon.rpc_last_warning_at >= 60:
+                daemon.rpc_last_warning_at = now
+                snapshot = await asyncio.to_thread(self._aria2_process_snapshot, daemon)
+                # 仅输出白名单指标，禁止记录 RPC 参数、完整 URL、请求头或命令行。
+                logger.warning(
+                    "[HTTP下载诊断] aria2 控制请求失败 method=%s 类型=%s 耗时=%.3f秒 "
+                    "连续异常=%s 异常持续=%.1f秒 进程快照=%s；此快照不代表已确定磁盘故障",
+                    method, type(exc.__cause__ or exc).__name__, now - started, daemon.rpc_failure_count,
+                    now - daemon.rpc_failure_since, snapshot,
+                )
+            raise
+        now = time.monotonic()
+        if daemon.rpc_failure_since is not None:
+            logger.info(
+                "[HTTP下载诊断] aria2 控制请求恢复 method=%s 耗时=%.3f秒 "
+                "异常持续=%.1f秒 累计异常=%s",
+                method, now - started, now - daemon.rpc_failure_since, daemon.rpc_failure_count,
+            )
+            daemon.rpc_failure_since = None
+            daemon.rpc_failure_count = 0
+            daemon.rpc_last_warning_at = None
+        elif now - started >= 2 and (
+            daemon.rpc_last_warning_at is None or now - daemon.rpc_last_warning_at >= 60
+        ):
+            daemon.rpc_last_warning_at = now
+            logger.warning(
+                "[HTTP下载诊断] aria2 控制请求缓慢 method=%s 耗时=%.3f秒 进程快照=%s",
+                method, now - started,
+                await asyncio.to_thread(self._aria2_process_snapshot, daemon),
+            )
+        return result
+
+    def _aria2_process_snapshot(self, daemon: Aria2Daemon) -> Dict[str, Any]:
+        """异常时只读内核指标；不访问下载盘，不读取命令行和环境变量。"""
+        pid = getattr(daemon.process, "pid", None)
+        snapshot: Dict[str, Any] = {"pid": pid}
+        if daemon.process is not None:
+            snapshot["exit_code"] = daemon.process.poll()
+        if os.name != "posix" or not isinstance(pid, int) or pid <= 0:
+            return snapshot
+        fields = {
+            f"/proc/{pid}/status": {"State", "VmRSS"},
+            f"/proc/{pid}/io": {"read_bytes", "write_bytes", "syscr", "syscw"},
+            "/proc/meminfo": {"MemAvailable", "Dirty", "Writeback"},
+        }
+        for path, allowed in fields.items():
+            with contextlib.suppress(OSError):
+                for line in Path(path).read_text().splitlines():
+                    key, _, value = line.partition(":")
+                    if key in allowed:
+                        snapshot[key] = value.strip()
+        with contextlib.suppress(OSError):
+            snapshot["wchan"] = Path(f"/proc/{pid}/wchan").read_text().strip()
+        return snapshot
 
     async def _rpc_call(self, method: str, params: List[Any]) -> Any:
         daemon = await self._ensure_daemon()
@@ -5702,6 +5792,9 @@ class HttpDownloadService:
             "dir": target_dir,
             "out": item["filename"],
             "continue": "true",
+            # 不在下载前预写整个大文件；分片优先按偏移选取以减少磁盘跳跃。
+            "file-allocation": "none",
+            "stream-piece-selector": "inorder",
             "max-tries": str(max(1, int(getattr(cfg, "retry_count", 5) or 5))),
             "retry-wait": str(max(0, int(getattr(cfg, "retry_wait_seconds", 5) or 5))),
             "connect-timeout": str(max(1, int(getattr(cfg, "connect_timeout_seconds", 15) or 15))),
@@ -6827,6 +6920,15 @@ class HttpDownloadService:
                     options["pause"] = "true"
                 gofile_submitted_count += 1
             gid = await self._rpc_call("aria2.addUri", [[item["url"]], options])
+            logger.info(
+                "[HTTP下载诊断] 已提交 task_id=%s gid=%s 平台=%s 路由=%s "
+                "分片=%s 单服连接=%s 最小分片=%s 文件分配=%s 分片策略=%s 暂停排队=%s",
+                task.id, gid, item.get("source", "http"),
+                "代理" if options.get("all-proxy") else "直连",
+                options.get("split"), options.get("max-connection-per-server"),
+                options.get("min-split-size"), options.get("file-allocation"),
+                options.get("stream-piece-selector"), options.get("pause", "false"),
+            )
             gids.append(str(gid))
             if str(item.get("source") or "").strip().lower() == "gofile" and options.get("pause") == "true":
                 gofile_paused_gids.append(str(gid))
@@ -7098,7 +7200,8 @@ class HttpDownloadService:
                         if existing.get("gid") == row.get("gid"):
                             existing.update(row)
                             break
-                await self._maybe_unpause_gofile_downloads(download_files, gofile_paused_gids)
+                if not runtime.get("control_error"):
+                    await self._maybe_unpause_gofile_downloads(download_files, gofile_paused_gids)
                 google_done = len(google_success_files)
                 google_failed = len(google_failed_rows)
                 transfer_done = len(transfer_success_files)
@@ -7116,7 +7219,11 @@ class HttpDownloadService:
                 })
                 task.task_metadata["download_files"] = download_files
                 task.task_metadata["download_runtime"] = runtime
-                task.current_step = runtime.get("current_file_name") or "下载中"
+                task.current_step = (
+                    "下载器控制接口暂不可用，等待恢复（请检查下载盘 I/O）"
+                    if runtime.get("control_error")
+                    else (runtime.get("current_file_name") or "下载中")
+                )
                 total = int(runtime.get("total_bytes") or total_bytes or 0)
                 transferred = int(runtime.get("transferred_bytes") or 0)
                 if total > 1:
@@ -7133,6 +7240,8 @@ class HttpDownloadService:
                     step = f"下载中 {runtime.get('completed_files', 0)}/{len(download_files)}"
                     if not size_known:
                         step += f"，已传 {self._format_bytes_for_error(transferred)}"
+                    if runtime.get("control_error"):
+                        step = task.current_step
                     task.update_progress(progress, step)
                 else:
                     # 进度事件按轮询节奏（1s）推送，日志仍按 5s 节流不刷屏。
@@ -7878,6 +7987,9 @@ class HttpDownloadService:
         keys = ["gid", "status", "totalLength", "completedLength", "downloadSpeed", "files", "errorMessage"]
         try:
             return await self._rpc_call("aria2.tellStatus", [gid, keys])
+        except HttpDownloadRpcError:
+            # 控制通道不可用时再查 stopped 只会重复阻塞，并掩盖原始调用。
+            raise
         except Exception as exc:
             stopped = await self._rpc_call("aria2.tellStopped", [0, 100, keys])
             for item in stopped or []:
@@ -8067,9 +8179,30 @@ class HttpDownloadService:
         active_name = ""
         active_rel = ""
         failed_count = 0
+        rpc_error = ""
         for gid in gids:
             try:
                 status = await self._tell_status(gid)
+            except HttpDownloadRpcError as exc:
+                rpc_error = str(exc)
+                # 不因一次控制请求超时终止真实下载或重新创建下载任务。
+                # 保留已知进度，下一轮重新查询；取消仍由任务外层处理。
+                for pending_gid in gids[gids.index(gid):]:
+                    row = row_by_gid.get(str(pending_gid))
+                    if not row:
+                        continue
+                    total_bytes += int(row.get("total") or 0)
+                    transferred += int(row.get("downloaded") or 0)
+                    row["speed_bytes_per_sec"] = 0
+                    row["control_error"] = rpc_error
+                    state = str(row.get("status") or "")
+                    if state == "completed":
+                        completed += 1
+                    elif state == "failed":
+                        failed_count += 1
+                    else:
+                        active_count += 1
+                break
             except Exception as exc:
                 row = row_by_gid.get(str(gid))
                 if row and str(row.get("status") or "") != "completed":
@@ -8080,6 +8213,7 @@ class HttpDownloadService:
             row = row_by_gid.get(str(gid))
             if not row:
                 continue
+            row.pop("control_error", None)
             aria_status = str(status.get("status") or "")
             total = int(status.get("totalLength") or row.get("total") or 0)
             done = int(status.get("completedLength") or 0)
@@ -8196,6 +8330,9 @@ class HttpDownloadService:
             "current_file_name": active_name,
             "current_relative_path": active_rel,
         }
+        if rpc_error:
+            runtime["status"] = "control_unavailable"
+            runtime["control_error"] = rpc_error
         all_done = completed + failed_count >= len(rows)
         return rows, runtime, all_done, failed_count
 
