@@ -978,3 +978,40 @@ class TestTaskEngine:
         engine._persisted_task_snapshot_versions[sample_task.id] = version_key
 
         assert engine._should_persist_task_snapshot(sample_task, version_key) is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_task_keeps_partial_download_batch_dir(tmp_path):
+    """下载类任务部分失败时不能整目录清理，否则已成功落盘的条目会被一起删掉。"""
+    engine = TaskEngine(max_concurrent=1)
+    batch_dir = tmp_path / "百度网盘_20261023_123447"
+    batch_dir.mkdir()
+    (batch_dir / "RJ01675700.zip").write_bytes(b"ok")
+
+    for task_type in (
+        TaskType.BAIDU_NETDISK_DOWNLOAD,
+        TaskType.HTTP_DOWNLOAD,
+        TaskType.ASMR_SYNC_DOWNLOAD,
+    ):
+        task = Task(
+            task_type=task_type,
+            source_path="pan.baidu.com",
+            output_path=str(batch_dir),
+            metadata={"partial_success": True},
+            status=TaskStatus.FAILED,
+        )
+        await engine._cleanup_failed_task(task)
+        assert (batch_dir / "RJ01675700.zip").exists(), task_type
+
+    # 非下载类任务仍然按原逻辑清理自己的失败产物
+    regular_dir = tmp_path / "temp_extract"
+    regular_dir.mkdir()
+    (regular_dir / "leftover.bin").write_bytes(b"x")
+    regular_task = Task(
+        task_type=TaskType.FILTER,
+        source_path="/test/file.zip",
+        output_path=str(regular_dir),
+        status=TaskStatus.FAILED,
+    )
+    await engine._cleanup_failed_task(regular_task)
+    assert not regular_dir.exists()

@@ -2744,3 +2744,49 @@ def test_share_preview_warning_translates_decode_failure():
 
     assert "content-encoding" not in message.lower()
     assert "无法解压" in message
+
+
+def test_baidu_password_suffix_is_not_appended_twice():
+    """提取密码模板必须幂等：重试/二次标准化不能再套一层 (密码)。"""
+    service = BaiduNetdiskService()
+
+    assert service._filename_with_extract_password("RJ01690838", "aiyu") == "RJ01690838(aiyu)"
+    assert service._filename_with_extract_password("RJ01690838(aiyu)", "aiyu") == "RJ01690838(aiyu)"
+    assert service._filename_with_extract_password("RJ01690838（aiyu）", "aiyu") == "RJ01690838（aiyu）"
+
+
+def test_baidu_retry_share_file_uses_original_name_not_renamed_name():
+    """重试要用下载行里的原始远端名，而不是已套过密码模板的落地名。"""
+    service = BaiduNetdiskService()
+    failed_row = {
+        "selection_key": "baidu:share",
+        "fs_id": "123456",
+        "name": "RJ01690838(aiyu).mp3",
+        "relative_path": "RJ01690838(aiyu).mp3",
+        "original_name": "RJ01690838.mp3",
+        "original_relative_path": "RJ01690838.mp3",
+        "remote_path": "/分享目录/RJ01690838.mp3",
+        "size": 1568616829,
+        "status": "failed",
+    }
+
+    share_file = service._retry_share_file_from_failed_row(failed_row)
+    assert share_file["name"] == "RJ01690838.mp3"
+    assert share_file["relative_path"] == "RJ01690838.mp3"
+
+    item = {
+        "selection_key": "baidu:share",
+        "filename": "分享目录",
+        "share_url": "https://pan.baidu.com/s/abc",
+        "extract_password": "aiyu",
+    }
+    row = service._download_row_from_share_file(
+        item,
+        share_file,
+        {"shareid": "1", "share_uk": "uk", "bdstoken": "tk", "randsk": "rs", "shorturl": "1abc", "share_url": "https://pan.baidu.com/s/abc"},
+        "0",
+        keep_share_root=False,
+    )
+    [row] = service._apply_custom_download_name_to_rows(item, [row])
+
+    assert row["name"] == "RJ01690838(aiyu).mp3"

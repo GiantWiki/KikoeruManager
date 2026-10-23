@@ -5166,11 +5166,28 @@ class TaskEngine:
         config = get_config()
         cleaned_paths = []
 
-        if task.type == TaskType.HTTP_DOWNLOAD:
-            logger.info("HTTP 下载任务失败/部分成功不清理下载根目录: %s", task.output_path)
-            return
-
         metadata = dict(task.task_metadata or {})
+
+        # 下载类任务的 output_path 是「容纳多个条目的批次目录/成品目录」，部分失败时
+        # 目录里已经有成功落盘的成品；整目录 rmtree 会把成功项一并删掉，而重试只重下
+        # 失败项（reset_task_for_retry 只把失败行塞回 selected_items），成功项无法自愈。
+        # 2026-10-23 百度网盘实测：RJ01675700 成功 / RJ01690838 失败 → 目录被删，
+        # 重试成功后只剩 RJ01690838，RJ01675700 永久丢失。
+        # partial_success 兜底是为了覆盖以后新增的下载类任务，不再逐个补枚举。
+        if (
+            task.type in {
+                TaskType.HTTP_DOWNLOAD,
+                TaskType.BAIDU_NETDISK_DOWNLOAD,
+                TaskType.ASMR_SYNC_DOWNLOAD,
+            }
+            or metadata.get("partial_success")
+        ):
+            logger.info(
+                "下载类任务失败/部分成功不清理下载目录: type=%s path=%s",
+                task.type,
+                task.output_path,
+            )
+            return
         rename_retry_source_path = str(metadata.get("rename_retry_source_path") or "").strip()
         if (
             task.status == TaskStatus.FAILED

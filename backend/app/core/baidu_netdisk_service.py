@@ -670,8 +670,23 @@ class BaiduNetdiskService:
         remote_path = str(item.get("remote_path") or item.get("path") or "").strip()
         if remote_path:
             item["path"] = remote_path
-        item["name"] = str(item.get("name") or item.get("filename") or item.get("original_name") or "百度网盘文件").strip()
-        item["relative_path"] = str(item.get("relative_path") or item.get("original_relative_path") or item.get("name") or "").strip()
+        # 下载行上的 name/relative_path 是「落地后」的名字（已经套过自定义重命名与
+        # 提取密码模板，如 RJ01690838(aiyu).mp3）。重试时如果直接拿它当远端文件名，
+        # 命名流水线会再套一次密码模板 → RJ01690838(aiyu)(aiyu)。因此优先回到
+        # 建行时记录的原始远端名 original_name / original_relative_path。
+        remote_name = str(
+            item.get("original_name")
+            or item.get("remote_name")
+            or item.get("name")
+            or item.get("filename")
+            or "百度网盘文件"
+        ).strip()
+        item["name"] = remote_name
+        item["relative_path"] = str(
+            item.get("original_relative_path")
+            or item.get("relative_path")
+            or remote_name
+        ).strip()
         item["size"] = _safe_int(item.get("size") or item.get("total") or item.get("size_bytes"))
         item["size_bytes"] = item["size"]
         item["is_dir"] = False
@@ -3452,9 +3467,30 @@ class BaiduNetdiskService:
     def _filename_with_extract_password(self, name: str, password: str, ext: str = "") -> str:
         safe_name = self._sanitize_path_part(name, "百度网盘文件")
         safe_password = self._sanitize_path_part(password, "")
-        if safe_password:
+        # 幂等：名字里已经带过密码标记时不再追加（重试/二次标准化会重复套模板，
+        # 典型症状 RJ01690838(aiyu) → RJ01690838(aiyu)(aiyu)）。
+        if safe_password and not self._name_has_password_marker(safe_name, safe_password):
             safe_name = self._render_filename_password_template(safe_name, safe_password)
         return f"{safe_name}{ext or ''}"
+
+    @staticmethod
+    def _name_has_password_marker(name: str, password: str) -> bool:
+        text = str(name or "").strip()
+        token = str(password or "").strip()
+        if not text or not token:
+            return False
+        wrappers = (
+            ("(", ")"),
+            ("（", "）"),
+            ("[", "]"),
+            ("［", "］"),
+            ("【", "】"),
+            ("{", "}"),
+            ("-", ""),
+            ("_", ""),
+            (" ", ""),
+        )
+        return any(text.endswith(f"{left}{token}{right}") for left, right in wrappers)
 
     def _render_filename_password_template(self, name: str, password: str) -> str:
         extract_config = getattr(get_config(), "extract", None)
@@ -3772,7 +3808,15 @@ class BaiduNetdiskService:
         })
         task.task_metadata["download_runtime"] = runtime
         task.output_path = finalized
-        task.update_progress(100, f"百度网盘下载完成，输出到 {finalized}")
+        if failed_files:
+            # 不能在有失败项时写「下载完成」，否则界面/日志出现「完成 100% + 失败」的自相矛盾
+            task.update_progress(
+                100,
+                "百度网盘下载部分完成"
+                f"（成功 {len(success_files)} 个，失败 {len(failed_files)} 个），输出到 {finalized}",
+            )
+        else:
+            task.update_progress(100, f"百度网盘下载完成，输出到 {finalized}")
         return {
             "success": not bool(failed_files),
             "partial_success": bool(failed_files),
