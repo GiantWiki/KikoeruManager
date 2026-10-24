@@ -48,6 +48,10 @@ class _ArchiveCancelled(RuntimeError):
     """归档在未发布任何成员前被取消。"""
 
 
+class _ArchiveSourceChanged(RuntimeError):
+    """归档源仍在下载或被同路径替换，等待稳定后重试。"""
+
+
 class _LeaseLost(RuntimeError):
     """归档 worker 的租约已被其他 worker 接管。"""
 
@@ -291,6 +295,35 @@ class DeferredArchiveService:
             if str((item or {}).get(key) or "").strip()
         }
 
+    @staticmethod
+    def _align_manifest_to_fresh(
+        sources: list[dict[str, Any]],
+        targets: list[dict[str, Any]],
+        fresh_manifest: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """按首卷优先顺序对齐已有 source/target，失败时保持原顺序。"""
+        source_by_path = {
+            _normalized_path(str(item.get("source_path") or "")): item
+            for item in sources
+        }
+        target_by_path = {
+            _normalized_path(str(item.get("source_path") or "")): item
+            for item in targets
+        }
+        ordered_sources: list[dict[str, Any]] = []
+        ordered_targets: list[dict[str, Any]] = []
+        for fresh in fresh_manifest:
+            normalized = _normalized_path(str(fresh.get("source_path") or ""))
+            source = source_by_path.get(normalized)
+            target = target_by_path.get(normalized)
+            if source is None or target is None:
+                return sources, targets
+            ordered_sources.append(source)
+            ordered_targets.append(target)
+        if len(ordered_sources) != len(sources) or len(ordered_targets) != len(targets):
+            return sources, targets
+        return ordered_sources, ordered_targets
+
     def _reserve_targets_sync(
         self,
         db: Any,
@@ -358,6 +391,20 @@ class DeferredArchiveService:
             return {"queued": False, "status": "skipped", "reason": "source_already_in_processed"}
 
         source_manifest, group_base = self._build_source_manifest(normalized_source)
+        # 非首卷在首卷尚未落盘时会被单独入队。用 manifest 内的可选字段记住这个
+        # 语义，执行前即使补全了首卷也不能把“误判孤儿”静默转换成整组作业。
+        first_volume_names = {
+            name.casefold()
+            for name in self._first_volume_names(os.path.basename(normalized_source))
+        }
+        manifest_names = {
+            str(item.get("filename") or "").casefold()
+            for item in source_manifest
+        }
+        if first_volume_names and not (first_volume_names & manifest_names):
+            for item in source_manifest:
+                if _normalized_path(str(item.get("source_path") or "")) == _normalized_path(normalized_source):
+                    item["late_volume_orphan"] = True
         idempotency_key = self._manifest_key(source_manifest, processed_dir)
         source_paths = self._manifest_paths(source_manifest, "source_path")
         db = SessionLocal()
@@ -649,8 +696,16 @@ class DeferredArchiveService:
         try:
             await self._update_parent_task(claim, "processing")
             self._broadcast(claim, "processing", "系统空闲，开始低优先级归档")
-            # 执行前刷新分卷清单：入队时尚未下载完成的后续分卷（如百度网盘
-            # 顺序落盘的 .7z.002）会被补进本次归档，避免只归档首卷、残留尾卷。
+            # 必须先按入队快照重验孤儿前提，再补全分卷。反过来的话，刷新会把
+            # 仍在输入目录的首卷加入 manifest，孤儿判定就看不见“首卷尚在”，
+            # 下载中途产生的尾卷作业会被误当成正常整组作业继续执行。
+            if await asyncio.to_thread(self._detect_stale_orphan_sync, claim):
+                logger.info(
+                    "[延后归档] 检测到首卷仍存在于输入目录，取消孤儿尾卷作业 job=%s",
+                    job_id,
+                )
+                raise _ArchiveCancelled()
+            # 确认不是误孤儿后，再补入入队后才落盘的同组后续分卷。
             try:
                 refreshed = await asyncio.to_thread(self._refresh_job_manifest_sync, job_id, epoch)
                 if refreshed.get("sources") and refreshed.get("targets"):
@@ -663,16 +718,6 @@ class DeferredArchiveService:
                     )
             except Exception as exc:
                 logger.warning("[延后归档] 执行前刷新分卷清单失败，按入队快照继续: %s", exc)
-            # 执行前重验孤儿前提：孤儿尾卷作业成立的前提是"首卷已被归档移走"。
-            # 若入队是下载中途的误判、首卷其实还在输入目录，正常解压流程会接管
-            # 整组分卷；此时本作业必须取消，否则身份校验（size/mtime/inode）会
-            # 因文件持续变化而无限重试失败。
-            if await asyncio.to_thread(self._detect_stale_orphan_sync, claim):
-                logger.info(
-                    "[延后归档] 检测到首卷仍存在于输入目录，取消孤儿尾卷作业 job=%s",
-                    job_id,
-                )
-                raise _ArchiveCancelled()
             for index, source in enumerate(claim["source_manifest"]):
                 self._raise_if_abort(self._copy_abort_reason(job_id, epoch, check_database=True))
                 await self._move_member(claim, index, source)
@@ -697,6 +742,18 @@ class DeferredArchiveService:
                 await self._update_parent_task(cancelled, "cancelled")
                 self._write_activity("archive_cancelled", "cancelled", cancelled, "", None)
                 self._broadcast(cancelled, "cancelled", "归档已取消")
+        except _ArchiveSourceChanged as exc:
+            deferred = await asyncio.to_thread(
+                self._defer_source_changed_sync, job_id, epoch, str(exc)
+            )
+            if deferred:
+                await self._update_parent_task(deferred, "waiting_retry")
+                self._broadcast(
+                    deferred,
+                    "waiting_retry",
+                    f"归档源仍在写入，等待稳定后重试: {exc}",
+                )
+            logger.info("[延后归档] 源文件变化，等待重试 job=%s: %s", job_id, exc)
         except _LeaseLost:
             # 不触碰已经由新 owner 接管的作业；它会从已发布成员状态安全恢复。
             logger.info("[延后归档] 租约已转移，停止本 worker job=%s", job_id)
@@ -826,12 +883,12 @@ class DeferredArchiveService:
             db.close()
 
     def _refresh_job_manifest_sync(self, job_id: str, epoch: int) -> dict[str, Any]:
-        """执行前刷新分卷清单，把入队后才出现的同组尾卷补进作业。
+        """执行前刷新分卷清单与仍为 pending 的成员身份。
 
         入队发生在业务任务完成时；百度网盘等下载器可能还在按顺序落盘
-        后续分卷。这里按首卷重新探测整组，新增成员以追加方式纳入，
-        已发布/已完成的成员不受影响。无法刷新时返回 None，调用方按
-        入队快照继续执行。
+        后续分卷。这里按现有成员重新探测整组：新成员追加，已有 pending
+        成员刷新 size/mtime/inode。只要已有任一成员发布，就禁止刷新旧身份，
+        避免把两次下载的不同版本混进同一归档。
         """
         db = SessionLocal()
         try:
@@ -841,40 +898,80 @@ class DeferredArchiveService:
             targets = [dict(item or {}) for item in list(job.target_manifest or [])]
             if not sources or not targets:
                 return {}
-            first_source = str(sources[0].get("source_path") or "")
-            if not first_source or not os.path.isfile(first_source):
-                return {}
-            try:
-                fresh_manifest, group_base = self._build_source_manifest(first_source)
-            except Exception as exc:
-                logger.debug("[延后归档] 执行前重新探测分卷组失败，保持入队快照: %s", exc)
-                return {}
             existing_paths = self._manifest_paths(sources, "source_path")
-            fresh_paths = self._manifest_paths(fresh_manifest, "source_path")
-            if fresh_paths <= existing_paths:
+            fresh_manifest: list[dict[str, Any]] = []
+            group_base = ""
+            for source in sources:
+                source_path = str(source.get("source_path") or "")
+                if not source_path or not os.path.isfile(source_path):
+                    continue
+                try:
+                    fresh_manifest, group_base = self._build_source_manifest(source_path)
+                except Exception as exc:
+                    logger.debug("[延后归档] 执行前重新探测分卷组失败，保持入队快照: %s", exc)
+                    continue
+                break
+            if not fresh_manifest:
                 return {}
+
+            has_published = any(
+                str((item or {}).get("state") or "") != "pending"
+                or bool(str((item or {}).get("sha256") or ""))
+                for item in targets
+            )
+            fresh_by_path = {
+                _normalized_path(str(item.get("source_path") or "")): item
+                for item in fresh_manifest
+            }
+            updated_sources: list[dict[str, Any]] = []
+            identity_changed = False
+            for source in sources:
+                normalized = _normalized_path(str(source.get("source_path") or ""))
+                fresh = fresh_by_path.get(normalized)
+                if fresh is None or has_published:
+                    updated_sources.append(source)
+                    continue
+                updated = dict(source)
+                for key in ("size", "inode", "device", "ctime_ns", "mtime_ns"):
+                    old_value = int(updated.get(key) or 0)
+                    new_value = int(fresh.get(key) or 0)
+                    if old_value != new_value:
+                        updated[key] = new_value
+                        identity_changed = True
+                updated_sources.append(updated)
+
             new_members = [
                 member for member in fresh_manifest
                 if _normalized_path(str(member.get("source_path") or "")) not in existing_paths
             ]
-            if not new_members:
+            if not identity_changed and not new_members:
                 return {}
-            processed_dir = os.path.dirname(str(targets[0].get("target_path") or "")) or ""
-            new_targets = self._reserve_extra_targets_sync(
-                db,
-                new_members=new_members,
-                existing_targets=targets,
-                processed_dir=processed_dir,
-                group_base=group_base,
-            )
-            job.source_manifest = sources + new_members
-            job.target_manifest = targets + new_targets
+
+            new_targets: list[dict[str, Any]] = []
+            if new_members:
+                processed_dir = os.path.dirname(str(targets[0].get("target_path") or "")) or ""
+                new_targets = self._reserve_extra_targets_sync(
+                    db,
+                    new_members=new_members,
+                    existing_targets=targets,
+                    processed_dir=processed_dir,
+                    group_base=group_base,
+                )
+            final_sources = updated_sources + new_members
+            final_targets = targets + new_targets
+            if not has_published:
+                final_sources, final_targets = self._align_manifest_to_fresh(
+                    final_sources, final_targets, fresh_manifest
+                )
+            job.source_manifest = final_sources
+            job.target_manifest = final_targets
             job.updated_at = self._database_now(db)
             db.commit()
             logger.info(
-                "[延后归档] 已补入 %d 个后续分卷 job=%s",
-                len(new_members),
+                "[延后归档] 已刷新分卷清单 job=%s 新增=%d 身份更新=%s",
                 job_id,
+                len(new_members),
+                identity_changed,
             )
             return {
                 "sources": [dict(item) for item in job.source_manifest],
@@ -1260,7 +1357,7 @@ class DeferredArchiveService:
             return
 
         if not self._matches_source_identity(source_path, source):
-            raise RuntimeError(f"归档源文件已变化或不存在: {source_path}")
+            raise _ArchiveSourceChanged(f"归档源文件已变化或不存在: {source_path}")
 
         checksum = ""
         published_here = False
@@ -1281,7 +1378,7 @@ class DeferredArchiveService:
                 os.remove(part_path)
             checksum = self._copy_to_part(source_path, part_path, should_abort)
             if not self._matches_source_identity(source_path, source):
-                raise RuntimeError(f"归档复制期间源文件已变化: {source_path}")
+                raise _ArchiveSourceChanged(f"归档复制期间源文件已变化: {source_path}")
             if self._hash_file(source_path, should_abort) != checksum:
                 raise RuntimeError(f"归档复制后的源文件校验失败: {source_path}")
             self._publish_part_no_replace(part_path, target_path)
@@ -1291,7 +1388,7 @@ class DeferredArchiveService:
             if not checksum:
                 checksum = self._hash_file(target_path, should_abort)
             if not self._matches_source_identity(source_path, source):
-                raise RuntimeError(f"归档发布前源文件已变化: {source_path}")
+                raise _ArchiveSourceChanged(f"归档发布前源文件已变化: {source_path}")
             if self._hash_file(source_path, should_abort) != checksum:
                 raise RuntimeError(f"归档发布前源文件校验失败: {source_path}")
             if self._hash_file(target_path, should_abort) != checksum:
@@ -1301,7 +1398,7 @@ class DeferredArchiveService:
             self._record_member_published_sync(job_id, epoch, index, checksum)
             recorded_published = True
             self._finalize_published_member_sync(job_id, epoch, index, checksum)
-        except (_YieldToForeground, _ArchiveCancelled, _ShutdownRequested):
+        except (_YieldToForeground, _ArchiveCancelled, _ArchiveSourceChanged, _ShutdownRequested):
             if published_here and not recorded_published:
                 # 还没有写 published 状态时目标完全由本次调用创建，可以安全回滚目标。
                 with contextlib.suppress(OSError):
@@ -1442,6 +1539,31 @@ class DeferredArchiveService:
         finally:
             db.close()
 
+    def _defer_source_changed_sync(self, job_id: str, epoch: int, error: str) -> Optional[dict[str, Any]]:
+        """源文件仍写入时延迟重试，不消耗真正的失败次数。"""
+        db = SessionLocal()
+        try:
+            job = db.query(DeferredArchiveJob).filter(DeferredArchiveJob.id == job_id).with_for_update().first()
+            if job is None:
+                return None
+            if int(job.lease_epoch or 0) != epoch or job.lease_owner != self._owner:
+                return None
+            now = self._database_now(db)
+            job.status = "waiting_retry"
+            job.last_error = str(error or "归档源文件仍在变化")[:4000]
+            job.available_at = now + timedelta(seconds=self._retry_delay_seconds())
+            job.completed_at = None
+            job.lease_owner = None
+            job.lease_until = None
+            job.updated_at = now
+            db.commit()
+            return self._job_payload(job)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def _fail_job_sync(self, job_id: str, epoch: int, error: str) -> Optional[dict[str, Any]]:
         db = SessionLocal()
         try:
@@ -1525,7 +1647,7 @@ class DeferredArchiveService:
             db.close()
 
     def retry_failed_sync(self, job_id: str) -> bool:
-        """人工恢复失败归档作业，已发布成员会由恢复 worker 校验后继续收口。"""
+        """人工恢复失败归档作业，并重建尚未发布成员的分卷清单。"""
         db = SessionLocal()
         try:
             job = db.query(DeferredArchiveJob).filter(
@@ -1533,6 +1655,58 @@ class DeferredArchiveService:
             ).with_for_update().first()
             if job is None or str(job.status or "") != "failed":
                 return False
+            sources = [dict(item or {}) for item in list(job.source_manifest or [])]
+            targets = [dict(item or {}) for item in list(job.target_manifest or [])]
+            has_published = any(
+                str((item or {}).get("state") or "") != "pending"
+                or bool(str((item or {}).get("sha256") or ""))
+                for item in targets
+            )
+            if sources and targets and not has_published:
+                fresh_manifest: list[dict[str, Any]] = []
+                group_base = ""
+                for source in sources:
+                    source_path = str(source.get("source_path") or "")
+                    if source_path and os.path.isfile(source_path):
+                        fresh_manifest, group_base = self._build_source_manifest(source_path)
+                        break
+                if not fresh_manifest:
+                    return False
+                fresh_by_path = {
+                    _normalized_path(str(item.get("source_path") or "")): item
+                    for item in fresh_manifest
+                }
+                updated_sources: list[dict[str, Any]] = []
+                for source in sources:
+                    fresh = fresh_by_path.get(_normalized_path(str(source.get("source_path") or "")))
+                    if fresh is None:
+                        updated_sources.append(source)
+                        continue
+                    updated = dict(source)
+                    for key in ("size", "inode", "device", "ctime_ns", "mtime_ns"):
+                        updated[key] = int(fresh.get(key) or 0)
+                    updated_sources.append(updated)
+                existing_paths = self._manifest_paths(sources, "source_path")
+                new_members = [
+                    member for member in fresh_manifest
+                    if _normalized_path(str(member.get("source_path") or "")) not in existing_paths
+                ]
+                if new_members:
+                    processed_dir = os.path.dirname(str(targets[0].get("target_path") or "")) or ""
+                    targets.extend(self._reserve_extra_targets_sync(
+                        db,
+                        new_members=new_members,
+                        existing_targets=targets,
+                        processed_dir=processed_dir,
+                        group_base=group_base,
+                    ))
+                final_sources, final_targets = self._align_manifest_to_fresh(
+                    updated_sources + new_members,
+                    targets,
+                    fresh_manifest,
+                )
+                job.source_manifest = final_sources
+                job.target_manifest = final_targets
             now = self._database_now(db)
             job.status = "pending"
             job.available_at = now

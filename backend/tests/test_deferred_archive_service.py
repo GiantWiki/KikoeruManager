@@ -3,6 +3,7 @@ import hashlib
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.orm import sessionmaker
 
 from app.core import deferred_archive_service as deferred_archive_module
@@ -396,3 +397,159 @@ def test_deferred_archive_yields_claim_before_copy_when_foreground_work_arrives(
         assert list(processed_dir.iterdir()) == []
 
     asyncio.run(run())
+
+
+def test_deferred_archive_source_change_defers_without_consuming_retry(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    source_dir = tmp_path / "input"
+    processed_dir = tmp_path / "processed"
+    source_dir.mkdir()
+    processed_dir.mkdir()
+    source = source_dir / "RJ01629299.zip"
+    source.write_bytes(b"initial archive payload")
+
+    service, session_factory = _configure_service(
+        monkeypatch, db_session, source_dir, processed_dir, tmp_path
+    )
+    queued = service.enqueue_sync(str(source))
+    claim = service._claim_next_job_sync()
+    assert claim is not None
+    source.write_bytes(b"archive payload changed while downloading")
+
+    with pytest.raises(deferred_archive_module._ArchiveSourceChanged):
+        service._move_member_sync(
+            claim["job_id"], claim["lease_epoch"], 0, claim["source_manifest"][0]
+        )
+
+    deferred = service._defer_source_changed_sync(
+        claim["job_id"], claim["lease_epoch"], "source changed"
+    )
+
+    assert deferred is not None
+    db = session_factory()
+    try:
+        job = db.query(DeferredArchiveJob).filter_by(id=queued["job_id"]).one()
+        assert job.status == "waiting_retry"
+        assert job.attempt_count == 0
+        assert job.lease_owner is None
+        assert job.completed_at is None
+    finally:
+        db.close()
+    assert source.exists()
+    assert list(processed_dir.iterdir()) == []
+
+
+def test_deferred_archive_refresh_updates_pending_source_identity(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    source_dir = tmp_path / "input"
+    processed_dir = tmp_path / "processed"
+    source_dir.mkdir()
+    processed_dir.mkdir()
+    source = source_dir / "RJ01629300.zip"
+    source.write_bytes(b"before")
+
+    service, session_factory = _configure_service(
+        monkeypatch, db_session, source_dir, processed_dir, tmp_path
+    )
+    queued = service.enqueue_sync(str(source))
+    claim = service._claim_next_job_sync()
+    assert claim is not None
+    source.write_bytes(b"after-refresh-payload")
+
+    refreshed = service._refresh_job_manifest_sync(queued["job_id"], claim["lease_epoch"])
+
+    assert refreshed["sources"][0]["size"] == source.stat().st_size
+    db = session_factory()
+    try:
+        job = db.query(DeferredArchiveJob).filter_by(id=queued["job_id"]).one()
+        assert job.source_manifest[0]["size"] == source.stat().st_size
+    finally:
+        db.close()
+
+
+def test_deferred_archive_refresh_keeps_published_source_identity(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    source_dir = tmp_path / "input"
+    processed_dir = tmp_path / "processed"
+    source_dir.mkdir()
+    processed_dir.mkdir()
+    source = source_dir / "RJ01629301.zip"
+    source.write_bytes(b"before")
+
+    service, session_factory = _configure_service(
+        monkeypatch, db_session, source_dir, processed_dir, tmp_path
+    )
+    queued = service.enqueue_sync(str(source))
+    claim = service._claim_next_job_sync()
+    assert claim is not None
+    original_size = claim["source_manifest"][0]["size"]
+    source.write_bytes(b"changed-after-publication")
+
+    db = session_factory()
+    try:
+        job = db.query(DeferredArchiveJob).filter_by(id=queued["job_id"]).one()
+        targets = [dict(item) for item in job.target_manifest]
+        targets[0]["state"] = "published"
+        targets[0]["sha256"] = "published-checksum"
+        job.target_manifest = targets
+        db.commit()
+    finally:
+        db.close()
+
+    refreshed = service._refresh_job_manifest_sync(queued["job_id"], claim["lease_epoch"])
+
+    assert refreshed.get("sources") is None or refreshed["sources"][0]["size"] == original_size
+
+
+def test_deferred_archive_retry_rebuilds_full_manifest(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    source_dir = tmp_path / "input"
+    processed_dir = tmp_path / "processed"
+    source_dir.mkdir()
+    processed_dir.mkdir()
+    tail = source_dir / "RJ01629302.7z.002"
+    tail.write_bytes(b"tail")
+
+    service, session_factory = _configure_service(
+        monkeypatch, db_session, source_dir, processed_dir, tmp_path
+    )
+    queued = service.enqueue_sync(str(tail))
+    first = source_dir / "RJ01629302.7z.001"
+    first.write_bytes(b"first")
+
+    db = session_factory()
+    try:
+        job = db.query(DeferredArchiveJob).filter_by(id=queued["job_id"]).one()
+        job.status = "failed"
+        job.attempt_count = 3
+        db.commit()
+    finally:
+        db.close()
+
+    assert service.retry_failed_sync(queued["job_id"]) is True
+
+    db = session_factory()
+    try:
+        job = db.query(DeferredArchiveJob).filter_by(id=queued["job_id"]).one()
+        assert job.status == "pending"
+        assert job.attempt_count == 0
+        assert [item["filename"] for item in job.source_manifest] == [
+            "RJ01629302.7z.001",
+            "RJ01629302.7z.002",
+        ]
+        assert len(job.target_manifest) == 2
+        assert all(item["state"] == "pending" for item in job.target_manifest)
+    finally:
+        db.close()
