@@ -815,6 +815,59 @@ class ExtractService:
 
         返回每个匹配兄弟（含 target 自身）的 ``{path, size, index}``。
         """
+        # 无标准 .zip 主卷的 ZIP 分卷：X.z01 + X.z02 + ...，末尾也可能是
+        # 下载源截断出来的 X.zi。通用策略只能拆出“base.z + 01”，无法把
+        # .zi 归入同一组，因此先做专门匹配。
+        zip_volume_match = re.fullmatch(
+            r'(?P<base>.+?)\.z(?P<num>\d{2})',
+            target_name,
+            re.IGNORECASE,
+        )
+        if zip_volume_match:
+            base = zip_volume_match.group('base')
+            if not os.path.isfile(os.path.join(directory, f"{base}.zip")):
+                entry_by_casefold = {entry.casefold(): entry for entry in entries}
+                z_pattern = re.compile(
+                    rf'^{re.escape(base)}\.z(?P<num>\d{{2}})$',
+                    re.IGNORECASE,
+                )
+                z_siblings: List[Dict[str, Any]] = []
+                for entry in entries:
+                    match = z_pattern.fullmatch(entry)
+                    if not match:
+                        continue
+                    full_path = os.path.join(directory, entry)
+                    if not os.path.isfile(full_path):
+                        continue
+                    try:
+                        size = os.path.getsize(full_path)
+                    except OSError:
+                        continue
+                    z_siblings.append({
+                        "path": full_path,
+                        "name": entry,
+                        "size": size,
+                        "index": int(match.group('num')),
+                    })
+                z_siblings.sort(key=lambda item: item["index"])
+                zi_entry = entry_by_casefold.get(f"{base}.zi".casefold())
+                if zi_entry:
+                    zi_path = os.path.join(directory, zi_entry)
+                    if os.path.isfile(zi_path):
+                        try:
+                            zi_size = os.path.getsize(zi_path)
+                        except OSError:
+                            zi_size = 0
+                        if zi_size:
+                            z_siblings.append({
+                                "path": zi_path,
+                                "name": zi_entry,
+                                "size": zi_size,
+                                "index": (z_siblings[-1]["index"] + 1) if z_siblings else 1,
+                            })
+                if len(z_siblings) >= 2:
+                    return z_siblings
+
         strategies = (
             re.compile(r'^(?P<prefix>.+?)(?P<num>\d+)$'),
             re.compile(r'^(?P<prefix>.+?)(?P<num>\d+)(?P<suffix>\.[^.]+)$'),

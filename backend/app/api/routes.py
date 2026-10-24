@@ -8062,6 +8062,12 @@ def _collect_split_archive_siblings(main_path: str):
     if not os.path.isfile(main_path):
         return [main_path] if os.path.exists(main_path) else []
 
+    from ..core.archive_volume_utils import detect_archive_volume_group
+
+    group = detect_archive_volume_group(main_path)
+    if group and len(group.volumes) > 1:
+        return list(group.volumes)
+
     parent_dir = os.path.dirname(main_path)
     filename = os.path.basename(main_path)
 

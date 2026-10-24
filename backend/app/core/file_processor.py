@@ -105,18 +105,47 @@ class FileProcessor:
         return os.path.isfile(f"{file_path}.aria2")
 
     @staticmethod
-    def _has_zip_volume_main(file_path: str) -> bool:
-        """判断 .zNN 是否有对应的 ZIP 主卷。
-
-        没有主卷的 .zNN 不能直接当作 ZIP 分卷跳过，因为下载源可能只是把
-        单体 7z 压缩包伪装成了 .z77 等后缀。
-        """
+    def _zip_volume_base_name(file_path: str) -> str:
         filename = os.path.basename(file_path)
-        match = re.fullmatch(r'(?P<base>.+)\.z\d{2}', filename, re.IGNORECASE)
-        if not match:
+        match = re.fullmatch(r'(?P<base>.+)\.(?:z\d{2}|zi)', filename, re.IGNORECASE)
+        return match.group('base') if match else ""
+
+    @classmethod
+    def _has_zip_volume_main(cls, file_path: str) -> bool:
+        """判断 .zNN 是否有对应的标准 ZIP 主卷。"""
+        base_name = cls._zip_volume_base_name(file_path)
+        if not base_name:
             return False
-        zip_main = os.path.join(os.path.dirname(file_path), f"{match.group('base')}.zip")
-        return os.path.isfile(zip_main)
+        return os.path.isfile(os.path.join(os.path.dirname(file_path), f"{base_name}.zip"))
+
+    @classmethod
+    def _has_zip_volume_companion(cls, file_path: str) -> bool:
+        """判断 .zNN/.zi 是否属于一个可识别的 ZIP 分卷组。
+
+        标准组是 ``X.zip + X.z01``；下载源也会产生无标准主卷的
+        ``X.z01 + X.z02`` 或被截断的 ``X.z01 + X.zi``。只有同目录确实存在
+        组关系时才跳过非首卷，避免误吞单体伪装包（如单独一个 ``X.z77``）。
+        """
+        base_name = cls._zip_volume_base_name(file_path)
+        if not base_name:
+            return False
+        directory = os.path.dirname(file_path)
+        filename = os.path.basename(file_path)
+        is_truncated_main = filename.casefold().endswith(".zi")
+        if not is_truncated_main:
+            if os.path.isfile(os.path.join(directory, f"{base_name}.zip")):
+                return True
+            if os.path.isfile(os.path.join(directory, f"{base_name}.zi")):
+                return True
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return False
+        pattern = re.compile(rf'^{re.escape(base_name)}\.z\d{{2}}$', re.IGNORECASE)
+        return any(
+            entry.casefold() != filename.casefold() and pattern.fullmatch(entry)
+            for entry in entries
+        )
 
     @staticmethod
     def _inherit_download_password_metadata(file_path: str, engine) -> dict:
@@ -486,10 +515,18 @@ class FileProcessor:
 
         # 先检查是否是分卷文件后缀，只有真正的主执行文件才创建任务。
         # .zNN 既可能是 ZIP 分卷，也可能只是把单体 7z 伪装成了 z77 等后缀；
-        # 只有同目录存在对应 .zip 主卷时，才按 ZIP 分卷跳过。
+        # 只有同目录确实存在组关系时才把非首卷跳过。无标准 .zip 的
+        # X.z01 + X.z02 / X.z01 + X.zi 也要由首卷统一建任务。
         z_match = re.search(r'\.z(\d{2})$', filename)
         if z_match and self._has_zip_volume_main(file_path):
             logger.debug(f"[FileProcessor] 跳过 ZIP 分卷文件，等待 *.zip 主文件: {filename}")
+            return False
+        if z_match and self._has_zip_volume_companion(file_path) and int(z_match.group(1)) > 1:
+            logger.debug(f"[FileProcessor] 跳过无标准主卷的 ZIP 非首卷，等待 .z01: {filename}")
+            return False
+        # .zi 是截断的 ZIP 主卷命名；存在 X.z01 时由 .z01 统一建任务。
+        if ext == '.zi' and self._has_zip_volume_companion(file_path):
+            logger.debug(f"[FileProcessor] 跳过截断 ZIP 主卷，等待 .z01: {filename}")
             return False
 
         # 旧式 RAR 分卷: .r00, .r01, ...，应该由 *.rar 主文件触发处理
@@ -585,8 +622,9 @@ class FileProcessor:
 
         zip_main_match = re.search(r'^(?P<base>.+)\.zip$', filename, re.IGNORECASE)
         zip_part_match = re.search(r'^(?P<base>.+)\.z\d{2}$', filename, re.IGNORECASE)
-        if zip_main_match or zip_part_match:
-            base_name = (zip_main_match or zip_part_match).group('base')
+        zip_truncated_match = re.search(r'^(?P<base>.+)\.zi$', filename, re.IGNORECASE)
+        if zip_main_match or zip_part_match or zip_truncated_match:
+            base_name = (zip_main_match or zip_part_match or zip_truncated_match).group('base')
             volume_set = self._build_zip_volume_set(directory, base_name)
             if volume_set:
                 logger.info(f"[FileProcessor] 检测到 ZIP 分卷组: {base_name}")
@@ -745,7 +783,11 @@ class FileProcessor:
 
         is_zip_volume = bool(
             re.search(r'\.z\d{2}$', basename, re.IGNORECASE)
-            and self._has_zip_volume_main(file_path)
+            and self._has_zip_volume_companion(file_path)
+        )
+        is_truncated_zip_main = bool(
+            basename.lower().endswith('.zi')
+            and self._has_zip_volume_companion(file_path)
         )
         is_potential_volume = any(
             re.search(p, basename, re.IGNORECASE)
@@ -753,7 +795,7 @@ class FileProcessor:
         ) or any(
             re.search(p, basename, re.IGNORECASE)
             for p in main_volume_patterns
-        ) or is_zip_volume
+        ) or is_zip_volume or is_truncated_zip_main
 
         if is_potential_volume:
             logger.debug(f"[FileProcessor] 检测到可能是分卷文件，等待其他分卷: {basename}")
@@ -775,7 +817,7 @@ class FileProcessor:
                 # - .zXX / .rXX：明显非主卷
                 # - .7z.NNN 中 NNN != 001：非首卷 7z 分卷
                 # - .partN（N>=2）：非首卷 RAR 多卷成员
-                if re.search(r'\.(z\d{2}|r\d{2})$', basename, re.IGNORECASE):
+                if re.search(r'\.(z\d{2}|zi|r\d{2})$', basename, re.IGNORECASE):
                     logger.warning(f"[FileProcessor] 分卷主文件尚未出现，暂不创建任务: {basename}")
                     return None
                 seven_z_member = re.search(r'\.7z\.(\d{3})$', basename, re.IGNORECASE)
@@ -842,36 +884,67 @@ class FileProcessor:
                 resume_fn()
 
     def _build_zip_volume_set(self, directory: str, base_name: str) -> Optional[VolumeSet]:
-        zip_path = os.path.join(directory, f"{base_name}.zip")
-        if not os.path.exists(zip_path):
-            return None
-
-        # 1. 标准 WinRAR ZIP 分卷 (.zXX)：X.zip + X.z01 + X.z02 + ...
-        z_volumes: List[str] = []
         try:
-            for file in os.listdir(directory):
-                if re.fullmatch(rf'{re.escape(base_name)}\.z\d{{2}}', file, re.IGNORECASE):
-                    z_volumes.append(os.path.join(directory, file))
+            entries = os.listdir(directory)
         except Exception as exc:
             logger.error(f"[FileProcessor] 查找 ZIP 分卷失败: {exc}")
             return None
+        by_casefold = {str(name).casefold(): str(name) for name in entries}
 
-        if z_volumes:
-            z_volumes.append(zip_path)
-            ordered = sorted(z_volumes, key=self._volume_sort_key)
+        def existing(name: str) -> str:
+            return os.path.join(directory, by_casefold.get(name.casefold(), name))
+
+        zip_path = existing(f"{base_name}.zip")
+        has_zip_main = os.path.isfile(zip_path)
+        zi_path = existing(f"{base_name}.zi")
+        has_truncated_main = os.path.isfile(zi_path)
+
+        z_pattern = re.compile(rf'^{re.escape(base_name)}\.z(\d{{2}})$', re.IGNORECASE)
+        z_volumes: List[tuple[int, str]] = []
+        for file in entries:
+            match = z_pattern.fullmatch(file)
+            if match:
+                z_volumes.append((int(match.group(1)), os.path.join(directory, file)))
+        z_volumes.sort(key=lambda item: item[0])
+
+        # 1. 标准 WinRAR ZIP 分卷 (.zXX)：X.zip + X.z01 + X.z02 + ...
+        if has_zip_main and z_volumes:
+            ordered = [path for _, path in z_volumes] + [zip_path]
+            ordered = sorted(ordered, key=self._volume_sort_key)
             return VolumeSet(base_name, ordered, 'zip_volume_main', entry_path=zip_path)
 
-        # 2. 非标准 .zip 主卷 + .NNN 纯数字分卷：X.zip + X.002 + X.003 + ...
+        # 2. 无标准 .zip 主卷的伪装/截断分卷：
+        #    X.z01 + X.z02 + ...，或 X.z01 + X.zi。
+        #    只认从 01 开始的连续序号；真正是否可解压仍由 ExtractService 的
+        #    魔数与尺寸闸门决定，本层不自动改源文件名。
+        if not has_zip_main and z_volumes:
+            indices = [index for index, _ in z_volumes]
+            if indices == list(range(1, len(indices) + 1)):
+                ordered = [path for _, path in z_volumes]
+                if has_truncated_main:
+                    ordered.append(zi_path)
+                if len(ordered) > 1:
+                    volume_type = (
+                        'zip_truncated_main'
+                        if has_truncated_main and len(z_volumes) == 1
+                        else 'zip_disguised_volumes'
+                    )
+                    logger.info(
+                        f"[FileProcessor] 检测到无标准主卷的 ZIP 分卷组: {base_name}, "
+                        f"volumes={[os.path.basename(p) for p in ordered]}"
+                    )
+                    return VolumeSet(base_name, ordered, volume_type, entry_path=ordered[0])
+
+        if not has_zip_main:
+            return None
+
+        # 3. 非标准 .zip 主卷 + .NNN 纯数字分卷：X.zip + X.002 + X.003 + ...
         #    7-Zip / 国内分卷工具创建多卷时首卷 .001 被改名为 .zip 留下的格式。
         #    后续 remap 流程在 ExtractService 里完成，这里仅识别为分卷组。
         numeric_volumes: List[str] = []
-        try:
-            for file in os.listdir(directory):
-                if re.fullmatch(rf'{re.escape(base_name)}\.\d{{3}}', file, re.IGNORECASE):
-                    numeric_volumes.append(os.path.join(directory, file))
-        except Exception as exc:
-            logger.error(f"[FileProcessor] 查找 ZIP 数字分卷失败: {exc}")
-            return None
+        for file in entries:
+            if re.fullmatch(rf'{re.escape(base_name)}\.\d{{3}}', file, re.IGNORECASE):
+                numeric_volumes.append(os.path.join(directory, file))
 
         if numeric_volumes:
             def _numeric_key(path: str) -> int:

@@ -131,14 +131,20 @@ def detect_archive_volume_group(
         if len(volumes) > 1:
             return ArchiveVolumeGroup(base, sort_archive_volumes(volumes), "zip_numeric_remapped")
 
-    match = re.fullmatch(r"(?P<base>.+)\.(?:zip|z\d{2})", filename, re.IGNORECASE)
+    match = re.fullmatch(r"(?P<base>.+)\.(?:zip|z\d{2}|zi)", filename, re.IGNORECASE)
     if match:
         base = match.group("base")
+        z_volumes = collect(rf"{re.escape(base)}\.z\d{{2}}")
         volumes = []
         zip_path = existing(f"{base}.zip")
         if os.path.isfile(zip_path):
             volumes.append(zip_path)
-        volumes.extend(collect(rf"{re.escape(base)}\.z\d{{2}}"))
+        volumes.extend(z_volumes)
+        # 下载源可能把最后一卷命名为 .zi（截断的 .zip）。只在没有标准主卷、
+        # 且已有 .zNN 分卷时并入，避免把无关的同名 .zi 当成 ZIP 末端卷。
+        zi_path = existing(f"{base}.zi")
+        if not os.path.isfile(zip_path) and z_volumes and os.path.isfile(zi_path):
+            volumes.append(zi_path)
         if len(volumes) <= 1:
             volumes.extend(collect(rf"{re.escape(base)}\.\d{{3}}"))
         if len(volumes) > 1:
