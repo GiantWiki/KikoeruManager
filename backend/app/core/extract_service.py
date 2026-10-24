@@ -967,6 +967,18 @@ class ExtractService:
         if not (ok_one_based or ok_zero_based):
             return None
 
+        # 语义闸门：序号连续 + 文件名全是标准分卷名（``X.z01..X.zNN``，末端可以是
+        # 下载源截断出来的 ``X.zi``）时，按定义就不是「伪装命名」，而是「缺末端
+        # ``.zip`` 卷」的原生分卷组，应该走 ``_build_zip_missing_main_volume_set``
+        # 补名解压，不该弹「请手动重命名分卷」让用户自己猜。只放行这一种形态：
+        # 非连续序号（``.z01 + .z03``）或含「删」等伪装词的后缀仍照旧提示重命名。
+        if all(
+            re.fullmatch(r'.+\.z\d{2}', str(item.get("name") or ""), re.IGNORECASE)
+            or re.fullmatch(r'.+\.zi', str(item.get("name") or ""), re.IGNORECASE)
+            for item in siblings
+        ):
+            return None
+
         # target 必须是首卷（index 在 siblings 里最小）；否则魔数判断没意义
         target_full = os.path.join(directory, target_name)
         target_entry = next((c for c in siblings if c["path"] == target_full), None)
@@ -1425,6 +1437,7 @@ class ExtractService:
         if archive_kind is None:
             type_to_kind = {
                 'zip_volume_main': 'zip',
+                'zip_missing_main_volume': 'zip',
                 'zip_numeric_split': 'zip',
                 '7z_volume_with_ext': '7z',
                 '7z_volume': '7z',
@@ -2571,6 +2584,7 @@ class ExtractService:
         self._cleanup_embedded_archive_view(task)
         await self._rollback_exe_e_remap(task)
         await self._rollback_zip_numeric_remap(task)
+        await self._rollback_zip_missing_main_remap(task)
         await self._rollback_part_exe_remap(task)
 
     async def extract(self, task: Task) -> Optional[str]:
@@ -2705,6 +2719,17 @@ class ExtractService:
                         f"[Extract] .zip 数字分卷已重命名: {task.source_path} -> {archive_path}"
                     )
                     task.source_path = archive_path
+
+            # 缺末端 .zip 卷的 ZIP 分卷（X.z01..X.zNN + X.zi，或末端被手工改成 .z0N）：
+            # 7zz 按 z01→z02→…→zip 续卷，缺 .zip 时直接报 "Missing volume : X.zip"。
+            # 解压前把末端卷临时改名成 X.zip，收尾时统一还原（见
+            # _cleanup_extract_runtime_state）。不补名就会走到"压缩包损坏"分支，
+            # 报错文案完全指不到真正原因。
+            if volume_set.type == 'zip_missing_main_volume':
+                self._set_extract_meta(task, extract_stage="remap_zip_missing_main")
+                task.update_progress(17, "补全 ZIP 分卷末端卷名")
+                volume_set = await self._remap_zip_missing_main_volume(volume_set, task)
+                archive_path = volume_set.entry_path or volume_set.volumes[0]
 
             # WinRAR 自解压多卷（首卷 X.part1.exe + 兄弟 X.partN.rar）：
             # 7zz 不会从 .exe 首卷按 .partN.rar 文件名规则续接兄弟卷，必然失败。
@@ -4425,7 +4450,12 @@ class ExtractService:
                 except Exception:
                     pass
 
-        logger.info("嵌套解压密码候选共 %d 个: %s", len(password_list), archive_name)
+        logger.info(
+            "嵌套解压密码候选共 %d 个: %s（源: %s）",
+            len(password_list),
+            self._format_password_candidates_for_log(password_list),
+            archive_name,
+        )
 
         # 嵌套 RAR fast-path：和外层主流程一样，优先用 unar 避开 7zz 24.08 RAR
         # 解析器无法配置文件名编码导致的日文 / 中文乱码（群晖看到 ��� 无法访问）。
@@ -5538,8 +5568,13 @@ class ExtractService:
 
         zip_main_match = re.search(r'^(?P<base>.+)\.zip$', filename, re.IGNORECASE)
         zip_part_match = re.search(r'^(?P<base>.+)\.z\d{2}$', filename, re.IGNORECASE)
-        if zip_main_match or zip_part_match:
-            base_name = (zip_main_match or zip_part_match).group('base')
+        # 下载源把末端卷截成 X.zi 之后，任务有可能直接落在 .zi 上（旧版本遗留的
+        # 问题作品项，或用户在问题作品页只选 .zi 重试）。不认这个入口就会整组
+        # 跳过，退化成单体解压必然失败。单独一个 .zi 不会成组，行为不变。
+        zip_terminal_match = re.search(r'^(?P<base>.+)\.zi$', filename, re.IGNORECASE)
+        zip_entry_match = zip_main_match or zip_part_match or zip_terminal_match
+        if zip_entry_match:
+            base_name = zip_entry_match.group('base')
             volume_set = self._build_zip_volume_set(directory, base_name)
             if volume_set:
                 logger.info(f"[VolumeSet] 检测到 ZIP 分卷组: {base_name}")
@@ -5646,7 +5681,11 @@ class ExtractService:
     def _build_zip_volume_set(self, directory: str, base_name: str) -> Optional['VolumeSet']:
         zip_path = os.path.join(directory, f"{base_name}.zip")
         if not os.path.exists(zip_path):
-            return None
+            # 缺末端 .zip 卷的 ZIP 分卷组：X.z01..X.zNN（+ 下载源截断出来的 X.zi）。
+            # 必须在这里就成组，否则会掉进「伪装多卷」兜底，把「缺末端卷」误报成
+            # 「请手动重命名分卷」（v2.6.59 用户实测 RJ01701267：7zz 实际报的是
+            # ``Missing volume : X.zip``，只是被兜底文案盖住了）。
+            return self._build_zip_missing_main_volume_set(directory, base_name)
 
         # 1. 标准 WinRAR ZIP 分卷 (.zXX)：X.zip + X.z01 + X.z02 + ...
         z_volumes: List[str] = []
@@ -5690,6 +5729,80 @@ class ExtractService:
             return VolumeSet(base_name, ordered, 'zip_numeric_split', entry_path=zip_path)
 
         return None
+
+    def _build_zip_missing_main_volume_set(
+        self,
+        directory: str,
+        base_name: str,
+    ) -> Optional['VolumeSet']:
+        """构建「缺末端 .zip 卷」的 ZIP 分卷组：``X.z01..X.zNN`` (+ ``X.zi``)。
+
+        Info-ZIP / 老 WinZip 的分卷约定是 ``X.z01`` → ``X.z02`` → … → ``X.zip``，
+        最后一卷（含中央目录）必须叫 ``.zip``。下载源经常把这一卷截成 ``X.zi``，
+        用户也可能手工把它改成 ``X.z0N`` 去"凑"标准命名。
+
+        没有 ``.zip`` 时 7zz 的报错是 ``Missing volume : X.zip``，整组解不出来；
+        本方法负责把整组认出来，解压前再由 ``_remap_zip_missing_main_volume`` 把
+        末端卷临时映射成 ``X.zip``。
+
+        安全闸门（任一不满足就返回 None，让上层走原失败链路）：
+
+        1. 序号必须从 ``.z01`` 起连续（``.z01 + .z03`` 这种断档不成组）。
+        2. 至少两卷：``.z01`` 本身不算组；``.z01 + .zi`` 算（最常见的下载源形态）。
+        3. 末端卷只认两种：唯一的 ``X.zi``，或没有 ``.zi`` 时序号最大的 ``.zNN``。
+        4. 首卷魔数不能明显是 7z / RAR（那是被改名成 ``.zNN`` 的伪装多卷）。
+        """
+        try:
+            entries = os.listdir(directory)
+        except Exception as exc:
+            logger.error(f"[VolumeSet] 查找缺主卷 ZIP 分卷失败: {exc}")
+            return None
+
+        z_pattern = re.compile(rf'^{re.escape(base_name)}\.z(?P<num>\d{{2}})$', re.IGNORECASE)
+        zi_pattern = re.compile(rf'^{re.escape(base_name)}\.zi$', re.IGNORECASE)
+
+        z_volumes: List[tuple] = []
+        zi_volumes: List[str] = []
+        for entry in entries:
+            z_match = z_pattern.fullmatch(entry)
+            if z_match:
+                z_volumes.append((int(z_match.group('num')), os.path.join(directory, entry)))
+                continue
+            if zi_pattern.fullmatch(entry):
+                zi_volumes.append(os.path.join(directory, entry))
+
+        if not z_volumes:
+            return None
+
+        z_volumes.sort(key=lambda item: item[0])
+        indices = [index for index, _ in z_volumes]
+        if indices != list(range(1, len(indices) + 1)):
+            return None
+
+        ordered = [path for _, path in z_volumes]
+
+        # 4. 魔数闸门：这组如果明显是 7z / RAR 卷被改名成 ``.zNN``（v2.6.59 让用户
+        # 手工重命名的那类「伪装多卷」），不能抢过来当 ZIP 分卷补名——补名只会让
+        # 用户拿到一个更看不懂的 7zz 错误。魔数识别不出（None）时放行：polyglot
+        # 前缀壳会让 PK 签名落在偏移 4（RJ01701267 实测），只看 offset 0 会误杀
+        # 真正的 ZIP 分卷。
+        first_kind = self._identify_archive_kind_by_magic(self._read_file_head(ordered[0], n=64))
+        if first_kind in ('7z', 'rar'):
+            return None
+
+        # 大小写敏感的文件系统上可能有 X.ZI / X.zi 多个变体，取排序后的第一个
+        # 保证同一目录多次扫描结果一致。
+        terminal_zi = sorted(zi_volumes)[0] if zi_volumes else None
+        if terminal_zi is None and len(ordered) < 2:
+            return None
+
+        volumes = ordered + ([terminal_zi] if terminal_zi else [])
+        logger.info(
+            "[VolumeSet] 检测到缺末端 .zip 的 ZIP 分卷组: %s, volumes=%s",
+            base_name,
+            [os.path.basename(path) for path in volumes],
+        )
+        return VolumeSet(base_name, volumes, 'zip_missing_main_volume', entry_path=ordered[0])
 
     def _build_exe_e_volume_set(self, directory: str, base_name: str) -> Optional['VolumeSet']:
         """构建自解压 .exe + .eNN 分卷组（国产 SFX 工具特有命名）。
@@ -6215,6 +6328,102 @@ class ExtractService:
         if task.task_metadata is not None:
             task.task_metadata.pop('zip_numeric_remap', None)
 
+    async def _remap_zip_missing_main_volume(
+        self,
+        volume_set: 'VolumeSet',
+        task: Optional[Task] = None,
+    ) -> 'VolumeSet':
+        """把「缺末端 .zip 卷」的 ZIP 分卷组补成 7zz 能续卷的标准命名。
+
+        背景：分卷 ZIP 的最后一卷（承载中央目录）必须叫 ``X.zip``。下载源常把
+        ``X.zip`` 截成 ``X.zi``，或用户手工改名成 ``X.z0N``；两种情况下 7zz 都会
+        报 ``Missing volume : X.zip``，而整组数据其实是完整的。
+
+        策略：
+
+        1. 只在 ``X.zip`` 不存在时动手，绝不覆盖已有文件。
+        2. 末端卷（``X.zi`` 或无 ``.zi`` 时序号最大的 ``.zNN``）原地 rename 成
+           ``X.zip``：同目录 rename 是原子操作，不复制数据（分卷动辄数 GB，
+           硬链接在跨挂载点时会退化成复制，不可接受）。
+        3. 改名映射写进 task_metadata，``_cleanup_extract_runtime_state`` 在
+           成功 / 失败 / 取消各分支统一还原，用户源目录最终保持原样。
+        4. 改名失败直接返回原 volume_set，让上层走原失败链路，不吞错。
+        """
+        if volume_set.type != 'zip_missing_main_volume' or not volume_set.volumes:
+            return volume_set
+
+        volumes = list(volume_set.volumes)
+        terminal = volumes[-1]
+        directory = os.path.dirname(terminal)
+        target_zip = os.path.join(directory, f"{volume_set.base_name}.zip")
+
+        if os.path.abspath(terminal) == os.path.abspath(target_zip):
+            return volume_set
+        if os.path.exists(target_zip):
+            logger.warning(
+                f"[ZipMissingMain] 目标 .zip 已存在，跳过补名以免覆盖: {target_zip}"
+            )
+            return volume_set
+
+        try:
+            await asyncio.to_thread(os.rename, terminal, target_zip)
+        except Exception as exc:
+            logger.error(
+                f"[ZipMissingMain] 末端卷补名失败: {terminal} -> {target_zip}, error={exc}"
+            )
+            return volume_set
+
+        logger.info(f"[ZipMissingMain] 末端卷补名: {terminal} -> {target_zip}")
+        if task is not None:
+            self._set_extract_meta(
+                task,
+                zip_missing_main_remap={
+                    'terminal': terminal,
+                    'renamed': target_zip,
+                },
+            )
+
+        renamed_volumes = volumes[:-1] + [target_zip]
+        ordered = sorted(renamed_volumes, key=self._volume_sort_key)
+        return VolumeSet(
+            volume_set.base_name,
+            ordered,
+            'zip_volume_main',
+            entry_path=ordered[0],
+        )
+
+    async def _rollback_zip_missing_main_remap(self, task: Task) -> None:
+        """把补名出来的 ``X.zip`` 还原成末端卷原名（如 ``X.zi``）。
+
+        与 ``_rollback_zip_numeric_remap`` 同策略：只有补名文件还在原位、且原名
+        未被占用时才还原，绝不覆盖用户后来放进来的文件。
+        """
+        meta = (task.task_metadata or {}).get('zip_missing_main_remap')
+        if not meta or not isinstance(meta, dict):
+            return
+        terminal = str(meta.get('terminal') or '').strip()
+        renamed = str(meta.get('renamed') or '').strip()
+        if not terminal or not renamed:
+            if task.task_metadata is not None:
+                task.task_metadata.pop('zip_missing_main_remap', None)
+            return
+
+        if not os.path.exists(renamed):
+            logger.info(f"[ZipMissingMain] 跳过还原（补名文件已不在原位）: {renamed}")
+        elif os.path.exists(terminal):
+            logger.warning(f"[ZipMissingMain] 跳过还原（原文件名已被占用）: {terminal}")
+        else:
+            try:
+                await asyncio.to_thread(os.rename, renamed, terminal)
+                logger.info(f"[ZipMissingMain] 还原末端卷名: {renamed} -> {terminal}")
+            except Exception as exc:
+                logger.error(
+                    f"[ZipMissingMain] 还原末端卷名失败: {renamed} -> {terminal}, error={exc}"
+                )
+
+        if task.task_metadata is not None:
+            task.task_metadata.pop('zip_missing_main_remap', None)
+
     async def _remap_part_exe_volumes(
         self,
         volume_set: 'VolumeSet',
@@ -6604,7 +6813,12 @@ class ExtractService:
                 passwords.append(password)
 
         if passwords:
-            logger.info("从文件名嗅探到 %s 个候选密码: %s", len(passwords), os.path.basename(archive_path))
+            logger.info(
+                "从文件名嗅探到 %s 个候选密码: %s（源: %s）",
+                len(passwords),
+                self._format_password_candidates_for_log(passwords),
+                os.path.basename(archive_path),
+            )
         return passwords
 
     def _get_filename_label_passwords(self, archive_path: str) -> List[str]:
@@ -6629,8 +6843,9 @@ class ExtractService:
 
         if passwords:
             logger.info(
-                "从文件名标签摘到 %s 个候选密码: %s",
+                "从文件名标签摘到 %s 个候选密码: %s（源: %s）",
                 len(passwords),
+                self._format_password_candidates_for_log(passwords),
                 os.path.basename(archive_path),
             )
         return passwords
@@ -6679,11 +6894,28 @@ class ExtractService:
 
         if passwords:
             logger.info(
-                "从包内条目名摘到 %s 个候选密码: %s",
+                "从包内条目名摘到 %s 个候选密码: %s（源: %s）",
                 len(passwords),
+                self._format_password_candidates_for_log(passwords),
                 os.path.basename(getattr(archive_info, "path", "") or ""),
             )
         return passwords
+
+    @staticmethod
+    def _format_password_candidates_for_log(passwords: Optional[List[str]], limit: int = 5) -> str:
+        """日志用：输出真实候选密码，而不是压缩包文件名。
+
+        历史上这几条日志把 ``os.path.basename(archive_path)`` 当成第二个 %s，
+        文案却是「候选密码: xxx」，排障时会误读成「整个文件名被当作密码」。
+        这里统一只列前 ``limit`` 个密码，超出部分用 ``…(+N)`` 省略。
+        """
+        values = [str(item) for item in (passwords or []) if str(item or "").strip()]
+        if not values:
+            return "（空）"
+        shown = ", ".join(values[:limit])
+        if len(values) > limit:
+            shown += f" …(+{len(values) - limit})"
+        return shown
 
     @staticmethod
     def _build_nested_inherited_passwords(

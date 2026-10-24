@@ -133,23 +133,125 @@ def test_disguised_scanner_maps_zi_to_final_volume(tmp_path):
     ]
 
 
-def test_disguised_detection_suggests_zip_names_for_z01_zi(tmp_path):
+def test_disguised_detection_skips_standard_z_volume_set(tmp_path):
+    """标准 .z01 + .zi 是「缺末端 .zip 卷」，不是伪装命名，不能弹重命名流程。"""
     z01 = tmp_path / "archive.z01"
     zi = tmp_path / "archive.zi"
     _write(z01)
     _write(zi)
 
-    detection = ExtractService()._detect_disguised_volume_set(str(z01))
+    assert ExtractService()._detect_disguised_volume_set(str(z01)) is None
 
-    assert detection is not None
-    assert [os.path.basename(item["old"]) for item in detection["suggested_renames"]] == [
-        z01.name,
-        zi.name,
-    ]
-    assert [os.path.basename(item["new"]) for item in detection["suggested_renames"]] == [
-        "archive.zip.001",
-        "archive.zip.002",
-    ]
+
+def test_extract_volume_set_includes_zi_as_terminal(tmp_path):
+    z01 = tmp_path / "archive.z01"
+    zi = tmp_path / "archive.zi"
+    _write(z01)
+    _write(zi)
+
+    volume_set = ExtractService()._detect_volume_set(str(z01))
+
+    assert volume_set is not None
+    assert volume_set.type == "zip_missing_main_volume"
+    assert volume_set.entry_path == str(z01)
+    assert [os.path.basename(path) for path in volume_set.volumes] == [z01.name, zi.name]
+
+
+def test_extract_volume_set_treats_last_z02_as_terminal(tmp_path):
+    """用户手工把 .zi 改成 .z02 后，序号最大的 zNN 就是末端卷。"""
+    z01 = tmp_path / "archive.z01"
+    z02 = tmp_path / "archive.z02"
+    _write(z01)
+    _write(z02)
+
+    volume_set = ExtractService()._detect_volume_set(str(z01))
+
+    assert volume_set is not None
+    assert volume_set.type == "zip_missing_main_volume"
+    assert [os.path.basename(path) for path in volume_set.volumes] == [z01.name, z02.name]
+
+
+def test_extract_volume_set_rejects_non_contiguous_z_volumes(tmp_path):
+    z01 = tmp_path / "archive.z01"
+    z03 = tmp_path / "archive.z03"
+    _write(z01)
+    _write(z03)
+
+    assert ExtractService()._detect_volume_set(str(z01)) is None
+
+
+def test_extract_volume_set_accepts_zi_as_entry(tmp_path):
+    """任务直接落在 .zi 上（旧版本遗留的问题作品项）也要能整组成组。"""
+    z01 = tmp_path / "archive.z01"
+    zi = tmp_path / "archive.zi"
+    _write(z01)
+    _write(zi)
+
+    volume_set = ExtractService()._detect_volume_set(str(zi))
+
+    assert volume_set is not None
+    assert volume_set.type == "zip_missing_main_volume"
+    assert os.path.basename(volume_set.entry_path) == z01.name
+    assert [os.path.basename(path) for path in volume_set.volumes] == [z01.name, zi.name]
+
+
+def test_extract_volume_set_accepts_zip_signature_behind_prefix(tmp_path):
+    """polyglot 前缀壳会让 PK 签名落在偏移 4，不能因此拒认分卷组。"""
+    z01 = tmp_path / "archive.z01"
+    zi = tmp_path / "archive.zi"
+    _write(z01, b"\x00\x00\x00\x00" + ZIP_PAYLOAD)
+    _write(zi, b"\x00\x00\x00\x00" + ZIP_PAYLOAD)
+
+    volume_set = ExtractService()._detect_volume_set(str(z01))
+
+    assert volume_set is not None
+    assert volume_set.type == "zip_missing_main_volume"
+
+
+def test_extract_volume_set_rejects_seven_zip_renamed_to_z(tmp_path):
+    """7z 分卷被改名成 .zNN 时属于伪装多卷，不能被 ZIP 补名链路抢走。"""
+    z01 = tmp_path / "archive.z01"
+    z02 = tmp_path / "archive.z02"
+    _write(z01, b"7z\xbc\xaf\x27\x1c" + b"\x00" * 4088)
+    _write(z02, b"7z\xbc\xaf\x27\x1c" + b"\x00" * 4088)
+
+    assert ExtractService()._detect_volume_set(str(z01)) is None
+
+
+def test_remap_zip_missing_main_volume_renames_terminal(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.core.extract_service import VolumeSet
+
+    z01 = tmp_path / "archive.z01"
+    zi = tmp_path / "archive.zi"
+    _write(z01)
+    _write(zi)
+
+    service = ExtractService()
+    volume_set = VolumeSet(
+        "archive",
+        [str(z01), str(zi)],
+        "zip_missing_main_volume",
+        entry_path=str(z01),
+    )
+    task = SimpleNamespace(task_metadata={})
+
+    remapped = asyncio.run(service._remap_zip_missing_main_volume(volume_set, task))
+
+    assert remapped.type == "zip_volume_main"
+    assert os.path.basename(remapped.entry_path) == z01.name
+    assert [os.path.basename(path) for path in remapped.volumes] == ["archive.z01", "archive.zip"]
+    assert (tmp_path / "archive.zip").exists()
+    assert not zi.exists()
+    assert task.task_metadata["zip_missing_main_remap"]["renamed"].endswith("archive.zip")
+
+    asyncio.run(service._rollback_zip_missing_main_remap(task))
+
+    assert zi.exists()
+    assert not (tmp_path / "archive.zip").exists()
+    assert "zip_missing_main_remap" not in task.task_metadata
 
 
 def test_disguised_detection_rejects_non_contiguous_z_volumes(tmp_path):
