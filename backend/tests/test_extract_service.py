@@ -4870,12 +4870,22 @@ Encrypted = +
             assert extract_service._extract_disguised_base_name(name, kind) == expected, name
 
     def test_detect_disguised_volume_set_build_standard_volume_name(self, extract_service):
-        """标准命名按 archive_kind 区分：7z / zip 走 ``.NNN``，rar 走 ``.partN.rar``。"""
+        """标准命名按 archive_kind 区分：7z 走 ``.7z.NNN``，rar 走 ``.partN.rar``。
+
+        ZIP 必须走 Info-ZIP 跨卷约定（``X.z01..X.zNN`` + 末端 ``X.zip``），
+        不能写成 7-Zip 的字节切分风格 ``X.zip.NNN``——两者容器互不兼容，
+        7-Zip 靠文件名选处理器，写错会直接打不开。详见 v2.6.61。
+        """
         assert extract_service._build_standard_volume_name('foo', '7z', 1) == 'foo.7z.001'
         assert extract_service._build_standard_volume_name('foo', '7z', 12) == 'foo.7z.012'
         assert extract_service._build_standard_volume_name('foo', 'rar', 1) == 'foo.part1.rar'
         assert extract_service._build_standard_volume_name('foo', 'rar', 5) == 'foo.part5.rar'
-        assert extract_service._build_standard_volume_name('foo', 'zip', 1) == 'foo.zip.001'
+        # ZIP：末卷是 .zip，其余按 .z01/.z02 顺序编号。
+        assert extract_service._build_standard_volume_name('foo', 'zip', 1, total=3) == 'foo.z01'
+        assert extract_service._build_standard_volume_name('foo', 'zip', 2, total=3) == 'foo.z02'
+        assert extract_service._build_standard_volume_name('foo', 'zip', 3, total=3) == 'foo.zip'
+        # 不能推出 .zip.NNN 这种字节切分命名。
+        assert '.zip.' not in extract_service._build_standard_volume_name('foo', 'zip', 5, total=9)
 
     # ------------------------------------------------------------------
     # _clean_disguised_volume_name：剥伪装垃圾字符

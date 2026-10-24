@@ -1002,7 +1002,9 @@ class ExtractService:
         base_name = self._extract_disguised_base_name(target_name, archive_kind)
         suggested = []
         for offset, c in enumerate(siblings, start=1):
-            new_name = self._build_standard_volume_name(base_name, archive_kind, offset)
+            new_name = self._build_standard_volume_name(
+                base_name, archive_kind, offset, total=len(siblings)
+            )
             new_path = os.path.join(directory, new_name)
             suggested.append({"old": c["path"], "new": new_path})
 
@@ -1052,19 +1054,37 @@ class ExtractService:
         return name or 'archive'
 
     @staticmethod
-    def _build_standard_volume_name(base_name: str, archive_kind: str, idx: int) -> str:
+    def _build_standard_volume_name(
+        base_name: str,
+        archive_kind: str,
+        idx: int,
+        total: int = 0,
+    ) -> str:
         """根据探测出的 archive_kind 给第 idx 卷生成标准命名。
 
         - ``7z`` → ``base.7z.NNN``（zero-padded 3 位）
         - ``rar`` → ``base.partN.rar``（不 pad）
-        - ``zip`` → ``base.zip.NNN``（zero-padded 3 位，对齐 7z 的 split file 风格）
+        - ``zip`` → ``base.z01..base.zNN`` + 末端 ``base.zip``（Info-ZIP 跨卷约定）
+
+        ZIP 这条曾经返回 ``base.zip.NNN``（7-Zip 的字节切分风格），已确认是错的：
+        ZIP 有两种互不兼容的多卷容器 —— Info-ZIP 跨卷（``X.z01`` → … → ``X.zip``，
+        每卷带跨卷标记）和字节切分（``X.zip.001`` …，纯字节拼接）。7-Zip 靠文件名
+        决定用哪个处理器：看到 ``.zNN`` 走跨卷处理器并自动跳过跨卷标记，看到
+        ``.zip.NNN`` 走字节拼接处理器、把标记当数据一起拼，结果是读不出来。
+        用户实测 RJ01701267：本来是 ``.z01 + .zi``（跨卷），按提示改成
+        ``.zip.001 + .zip.002`` 后 `7zz l` 直接返回码 2 且无任何错误输出，
+        而改名前的 ``.z01`` 在 17:08 那轮 `7zz x` 是能读到条目并解出 MP3 的。
+        跨卷命名对"本来就是字节切分"的 ZIP 同样有效（同一串字节按序读即可），
+        反过来则不成立，所以统一推荐跨卷命名。
         """
         if archive_kind == 'rar':
             return f"{base_name}.part{idx}.rar"
         if archive_kind == '7z':
             return f"{base_name}.7z.{idx:03d}"
-        # zip / 兜底
-        return f"{base_name}.zip.{idx:03d}"
+        # ZIP：末端卷必须叫 .zip，前面按 .z01/.z02 顺序编号。
+        if total and idx >= total:
+            return f"{base_name}.zip"
+        return f"{base_name}.z{idx:02d}"
 
     def _maybe_raise_disguised_volume_set(self, archive_path: str, task: Task) -> None:
         """伪装多卷探测兜底；命中则把 payload 写进 task_metadata 并抛异常。
@@ -7671,6 +7691,29 @@ class ExtractService:
                     self._save_cached_archive_info(archive_path, archive_info)
             return archive_info
 
+        # 空密码那一轮顺便收集 7z 诊断：若 7zz 返回非零码且一个字都不输出，说明它
+        # 根本打不开这个文件（典型：分卷命名与容器格式不匹配），此时挨个试密码毫无
+        # 意义 —— 每轮要在 4GiB 分卷上白烧两次 5s 的 list 子进程，任务会长期钉在
+        # 20%。用户实测 RJ01701267 把 .z01/.zi 按旧提示改成 .zip.001/.zip.002 后
+        # 就是这样卡住的。
+        probe_diagnostics: Dict[str, Any] = {}
+        probe_reported = [False]
+
+        def probe_is_unreadable() -> bool:
+            if not probe_diagnostics.get("all_empty_diagnostic"):
+                return False
+            if not probe_reported[0]:
+                probe_reported[0] = True
+                logger.error(
+                    "[7z][list] 空密码探测时 7zz 返回非零码且无任何错误输出 %s，"
+                    "判定为分卷命名与容器格式不匹配（非密码问题），跳过剩余 %d 个密码候选: archive=%s",
+                    [item.get("returncode") for item in probe_diagnostics.get("attempts") or []],
+                    max(len(unique_passwords) - 1, 0),
+                    archive_path,
+                )
+                self._set_extract_meta(task, archive_probe_unreadable=True)
+            return True
+
         for password in unique_passwords:
             password_cache_key = (
                 self._password_cache_key(archive_fingerprint, password)
@@ -7705,8 +7748,11 @@ class ExtractService:
                         update_task_progress=update_task_progress,
                         cache_key=password_cache_key,
                         lock_already_held=True,
+                        diagnostics=(probe_diagnostics if not password else None),
                     )
                     if file_list is None:
+                        if not password and probe_is_unreadable():
+                            break
                         continue
                     if file_list is not None:
                         return build_archive_info(password, file_list)
@@ -7729,6 +7775,7 @@ class ExtractService:
                         command_timeout=list_timeout,
                         slot_wait_timeout=slot_wait_timeout,
                         update_task_progress=update_task_progress,
+                        diagnostics=(probe_diagnostics if not password else None),
                     )
                 except ArchiveInspectSlotTimeout as exc:
                     logger.warning(
@@ -7739,6 +7786,8 @@ class ExtractService:
                     return None
             if file_list is not None:
                 return build_archive_info(password, file_list)
+            if not password and probe_is_unreadable():
+                break
 
         logger.warning("无法预读取压缩包内容，后续将尝试直接解压: %s", archive_path)
         return None
@@ -7883,11 +7932,17 @@ class ExtractService:
         update_task_progress: bool = True,
         cache_key: Optional[Tuple[str, str]] = None,
         lock_already_held: bool = False,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[List[Dict]]:
         """列出压缩包内容，自动检测最佳编码
 
         task 不为 None 时把 7zz 子进程注册到 task，cancel/pause 或协程级
         asyncio.Task.cancel() 都会立刻 kill 子进程。
+
+        ``diagnostics`` 是可选出参（保持既有调用点不变）：传入 dict 时会被填入
+        ``attempts`` / ``all_empty_diagnostic``，用于区分「密码不对」和「7z 根本
+        打不开这个文件」。后者 7z 会返回非零码却**一个字都不输出**，光看返回码
+        与密码错误无法区分，会把整库密码挨个试一遍。
         """
         if cache_key is None:
             archive_fingerprint = self._archive_fingerprint(archive_path)
@@ -7913,6 +7968,7 @@ class ExtractService:
                 slot_wait_timeout=slot_wait_timeout,
                 update_task_progress=update_task_progress,
                 cache_key=cache_key,
+                diagnostics=diagnostics,
             )
 
         if not cache_key or lock_already_held:
@@ -7938,6 +7994,7 @@ class ExtractService:
         slot_wait_timeout: Optional[float] = None,
         update_task_progress: bool = True,
         cache_key: Optional[Tuple[str, str]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[List[Dict]]:
         password_args = [f'-p{password}'] if password else []
         mcp_args = self._get_mcp_args(archive_path, filename_encoding=filename_encoding)
@@ -7945,6 +8002,21 @@ class ExtractService:
             [self.seven_zip, 'l', '-ba', *mcp_args, *password_args, archive_path],
             [self.seven_zip, 'l', '-slt', *mcp_args, *password_args, archive_path],
         ]
+
+        # 诊断收集：正常解压不关心，只在"7z 打不开文件"时用来区分原因。
+        attempt_diagnostics: List[Dict[str, Any]] = []
+
+        def publish_diagnostics() -> None:
+            if diagnostics is None:
+                return
+            failed = [item for item in attempt_diagnostics if item.get("returncode") != 0]
+            diagnostics.update({
+                "archive": archive_path,
+                "attempts": attempt_diagnostics,
+                "all_empty_diagnostic": bool(failed) and all(
+                    not str(item.get("stderr") or "").strip() for item in failed
+                ),
+            })
 
         for index, cmd in enumerate(commands):
             try:
@@ -7960,6 +8032,11 @@ class ExtractService:
                     stderr_text = result.stderr.decode('utf-8', errors='ignore')
                     if result.returncode == -8:
                         raise ArchiveInspectSlotTimeout(stderr_text or "等待 7z 清单/探测槽位超时")
+                    attempt_diagnostics.append({
+                        "returncode": result.returncode,
+                        "stderr": stderr_text,
+                        "command": "slt" if index == 1 else "ba",
+                    })
                     logger.warning(
                         f"[7z] 列出压缩包内容失败，返回码: {result.returncode}, 错误: {stderr_text[:500]}"
                     )
@@ -7969,6 +8046,7 @@ class ExtractService:
                             "[7z][list] 密码错误已写入负缓存，并停止同密码 fallback list: archive=%s",
                             os.path.basename(str(archive_path or "")),
                         )
+                        publish_diagnostics()
                         return None
                     continue
 
@@ -7990,6 +8068,7 @@ class ExtractService:
                 raise
             except Exception as e:
                 logger.error(f"列出压缩包内容失败: {e}")
+        publish_diagnostics()
         return None
 
     def _decode_7z_stdout(self, raw_bytes: bytes) -> tuple[str, str]:
@@ -10153,6 +10232,16 @@ class ExtractService:
                 extract_failure_stderr=self._redact_sensitive_text(last_corrupt_stderr[:1000]),
             )
             return False, None, "archive_corrupt"
+        if (task.task_metadata or {}).get("archive_probe_unreadable"):
+            # 7zz 对空密码都一个字不输出、解压也没抓到任何诊断：这不是密码问题，
+            # 而是它压根打不开这个分卷组。落到 wrong_password 会让用户去翻密码库，
+            # 方向完全错，所以单独立一个原因。
+            logger.error(
+                "所有密码尝试均失败，且 7zz 全程未输出任何诊断，判定为无法打开的分卷组: %s",
+                archive_info.path,
+            )
+            self._set_extract_meta(task, extract_failure_reason="archive_unreadable")
+            return False, None, "archive_unreadable"
         return False, None, "wrong_password"
 
     async def _verify_extraction(self, archive_info: ArchiveInfo, output_path: str) -> bool:

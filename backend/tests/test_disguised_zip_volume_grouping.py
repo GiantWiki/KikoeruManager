@@ -289,3 +289,48 @@ def test_conflict_skip_collects_z01_and_z02(tmp_path):
     siblings = _collect_split_archive_siblings(str(z02))
 
     assert {os.path.basename(path) for path in siblings} == {z01.name, z02.name}
+
+
+def test_zip_standard_volume_name_uses_spanning_convention():
+    """ZIP 的推荐改名必须是 Info-ZIP 跨卷命名，不能是 .zip.NNN 字节切分命名。
+
+    用户实测 RJ01701267：按旧建议把 .z01/.zi 改成 .zip.001/.zip.002 后，
+    7-Zip 改用字节拼接处理器，`7zz l` 直接返回码 2 且无任何错误输出，
+    本来能解的包被改成了读不出来的包。
+    """
+    service = ExtractService()
+
+    first = service._build_standard_volume_name("foo", "zip", 1, total=3)
+    middle = service._build_standard_volume_name("foo", "zip", 2, total=3)
+    last = service._build_standard_volume_name("foo", "zip", 3, total=3)
+
+    assert first == "foo.z01"
+    assert middle == "foo.z02"
+    assert last == "foo.zip"
+
+
+def test_disguised_zip_suggestion_ends_with_dot_zip(tmp_path):
+    """伪装 ZIP 分卷的改名建议：中间卷 .zNN，末端卷 .zip。"""
+    v1 = tmp_path / "foo.z7.001"
+    v2 = tmp_path / "foo.z7.002"
+    _write(v1)
+    _write(v2)
+
+    detection = ExtractService()._detect_disguised_volume_set(str(v1))
+
+    assert detection is not None
+    assert detection["detected_kind"] == "zip"
+    suggested = [os.path.basename(item["new"]) for item in detection["suggested_renames"]]
+    assert suggested == ["foo.z01", "foo.zip"]
+
+
+def test_archive_unreadable_reason_has_actionable_message():
+    from app.core.failure_reason_formatter import format_extract_failure_message
+
+    message = format_extract_failure_message(
+        {"extract_failure_reason": "archive_unreadable"},
+        "兜底文案",
+    )
+
+    assert "无法打开" in message
+    assert "X.zip.001" in message

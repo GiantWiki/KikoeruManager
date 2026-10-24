@@ -9,6 +9,11 @@ _EXTRACT_REASON_MESSAGES = {
     "missing_password": "解压失败：压缩包需要密码，但当前没有可用密码",
     "disk_full": "解压失败：临时目录磁盘空间不足",
     "volume_incomplete": "解压失败：分卷压缩包不完整或自解压分卷视图异常",
+    "archive_unreadable": (
+        "解压失败：7z 无法打开该分卷组（返回非零码但没有任何错误输出）。"
+        "最常见原因是分卷命名与压缩包容器格式不匹配——"
+        "Info-ZIP 跨卷包必须叫 X.z01…X.zip，不能改成 X.zip.001/X.zip.002"
+    ),
     "archive_corrupt": "解压失败：压缩包损坏或下载不完整（Headers/Data Error）",
     "path_too_long": "解压失败：路径或文件名过长（Linux 单个文件名通常最多 255 字节）",
     "unsupported_method": "解压失败：当前 7z 不支持该压缩方法",
