@@ -245,3 +245,59 @@ def test_apply_hints_user_rule_beats_filename_label():
     apply_hints_to_preview(preview, hints, rules=[r"解压码(\d+)"])
     row = preview["items"][0]["preview_files"][0]
     assert row["custom_extract_password"] == "1021"
+
+
+# ---------------------------------------------------------------------------
+# 跨行 / 同段粘贴：起任务阶段没有文件名标签兜底，解析必须尽量认全
+# ---------------------------------------------------------------------------
+
+
+def test_password_in_same_segment_as_url_keeps_url():
+    """``URL 解压码10221``（空格同段）：旧实现命中解压码后 continue，链接被丢掉。"""
+    parsed = parse_standard_input(f"{URL} 解压码10221 RJ01607138")
+    assert parsed is not None
+    urls, hints = parsed
+    assert urls == [URL]
+    hint = hints[share_identity(URL)]
+    assert hint["extract_password"] == "10221"
+    assert hint["rj"] == "RJ01607138"
+
+
+def test_prefix_text_before_url_is_tolerated():
+    """``链接：URL 解压码：10221 RJ…`` 这类带前缀的写法。"""
+    parsed = parse_standard_input(f"链接：{URL} 解压码：10221 RJ01607138")
+    assert parsed is not None
+    _, hints = parsed
+    hint = hints[share_identity(URL)]
+    assert hint["extract_password"] == "10221"
+    assert hint["rj"] == "RJ01607138"
+
+
+def test_multiline_paste_binds_continuation_lines_to_url():
+    """链接一行、解压码一行、RJ 一行：续行必须并入链接，否则整段 hint 为空。"""
+    text = f"{URL}\n解压码10221.z1p\nRJ01607138(10221).z1p"
+    parsed = parse_standard_input(text)
+    assert parsed is not None
+    urls, hints = parsed
+    assert urls == [URL]
+    hint = hints[share_identity(URL)]
+    assert hint["extract_password"] == "10221"  # 归档后缀要剥掉
+    assert hint["rj"] == "RJ01607138"
+
+
+def test_multiline_password_before_url_binds_forward():
+    parsed = parse_standard_input(f"解压码10221\n{URL}")
+    assert parsed is not None
+    _, hints = parsed
+    assert hints[share_identity(URL)]["extract_password"] == "10221"
+
+
+def test_multiline_two_entries_do_not_cross_bind():
+    other = "https://pan.baidu.com/s/1zzzzzzz?pwd=bbbb"
+    text = f"{URL}?pwd=aaaa\nRJ00000001\n{other}\nRJ00000002"
+    parsed = parse_standard_input(text)
+    assert parsed is not None
+    urls, hints = parsed
+    assert urls == [f"{URL}?pwd=aaaa", other]
+    assert hints[share_identity(urls[0])]["rj"] == "RJ00000001"
+    assert hints[share_identity(urls[1])]["rj"] == "RJ00000002"

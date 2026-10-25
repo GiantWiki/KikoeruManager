@@ -25,7 +25,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from .password_utils import extract_labeled_password
+from .password_utils import extract_labeled_password, strip_archive_suffix
 
 _PASS_CODE_QUERY_KEYS = ("pwd", "password", "passcode", "pass_code", "code")
 
@@ -105,6 +105,18 @@ def _clean_password(value: str) -> str:
     return text.strip()
 
 
+def _clean_inline_password(value: str) -> str:
+    """规范输入行里的解压码：额外切掉粘贴文件名带进来的归档后缀。
+
+    只用于「解压码: xxx」标签解析；用户自定义正则的结果必须原样保留
+    （``extract_password_by_rules`` 的既有契约）。
+    """
+    text = _clean_password(value)
+    if not text:
+        return ""
+    return strip_archive_suffix(text) or text
+
+
 def _pass_code_from_url(url: str) -> str:
     try:
         parsed = urlparse(str(url or ""))
@@ -125,13 +137,6 @@ def _append_pass_code(url: str, code: str) -> str:
     return f"{text}{'&' if '?' in text else '?'}pwd={quote(code)}"
 
 
-def _is_url_segment(value: str) -> bool:
-    text = str(value or "").strip()
-    if not text:
-        return False
-    return bool(_URL_RE.match(text) or _BARE_URL_RE.match(text))
-
-
 def _normalize_url(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -145,44 +150,61 @@ def _split_segments(line: str) -> List[str]:
     return [segment for segment in _SEGMENT_SPLIT_RE.split(str(line or "")) if segment.strip()]
 
 
-def _parse_standard_line(line: str) -> Optional[Dict[str, str]]:
-    """解析一行规范格式；不命中返回 ``None``（调用方退回既有识别）。"""
-    segments = _split_segments(line)
-    if not segments:
-        return None
-    rj = ""
-    url = ""
-    pass_code = ""
-    password = ""
-    for segment in segments:
-        text = segment.strip()
+def _collect_segment_part(segment: str, state: Dict[str, str]) -> None:
+    """从一段文本里抽取 解压码 / 链接 / 提取码 / RJ；**段内多要素也能全部认出**。
+
+    为什么不能「命中一种要素就 continue」：用户经常写成
+    ``https://pan.baidu.com/s/1abc 解压码10221``（同一段，空格分隔，没有竖线）。
+    旧实现先匹配解压码并 continue，链接跟着整段被丢掉，整行判定失败、密码与 RJ
+    全部回退成「无规范格式」。这里改成「摘掉已识别的片段，继续看剩余文本」。
+    """
+    text = str(segment or "").strip()
+    if not text:
+        return
+    # 1) 解压码必须最先摘掉：否则残留的裸串会被 allow_bare 当成提取码。
+    password_match = _EXTRACT_PASSWORD_LABEL_RE.search(text)
+    if password_match:
+        if not state["password"]:
+            state["password"] = _clean_inline_password(password_match.group(1))
+        text = f"{text[:password_match.start()]} {text[password_match.end():]}".strip()
         if not text:
-            continue
-        # 解压码必须最先摘掉：否则残留的裸串会被 allow_bare 当成提取码。
-        password_match = _EXTRACT_PASSWORD_LABEL_RE.search(text)
-        if password_match:
-            if not password:
-                password = _clean_password(password_match.group(1))
-            continue
-        if _is_url_segment(text):
-            if not url:
-                url_match = _URL_RE.search(text) or _BARE_URL_RE.search(text)
-                url = _normalize_url(url_match.group(0) if url_match else text)
-            continue
-        pass_code_match = _PASS_CODE_LABEL_RE.search(text)
-        if pass_code_match:
-            if not pass_code:
-                pass_code = pass_code_match.group(1)
-            continue
-        if _RJ_HEAD_RE.match(text):
-            if not rj:
-                rj = extract_rj(text)
-            continue
+            return
+    # 2) 链接：不再要求位于段首，``链接：https://...`` 同样能认。
+    url_match = _URL_RE.search(text) or _BARE_URL_RE.search(text)
+    if url_match:
+        if not state["url"]:
+            state["url"] = _normalize_url(url_match.group(0))
+        text = f"{text[:url_match.start()]} {text[url_match.end():]}".strip()
+        if not text:
+            return
+    # 3) 提取码：链接已摘除，不会误命中 URL 自带的 ?pwd=。
+    pass_code_match = _PASS_CODE_LABEL_RE.search(text)
+    if pass_code_match:
+        if not state["pass_code"]:
+            state["pass_code"] = pass_code_match.group(1)
+        text = f"{text[:pass_code_match.start()]} {text[pass_code_match.end():]}".strip()
+        if not text:
+            return
+    # 4) RJ：剩余文本里出现 RJ 号就取（``RJ01607138(10221).z1p`` / 带前缀文字都算）。
+    if not state["rj"] and text:
+        state["rj"] = extract_rj(text)
+
+
+def _parse_standard_segments(segments: Iterable[str]) -> Optional[Dict[str, str]]:
+    """解析一组段（可来自多行合并）；不命中返回 ``None``（调用方退回既有识别）。"""
+    state = {"rj": "", "url": "", "pass_code": "", "password": ""}
+    for segment in segments:
+        _collect_segment_part(segment, state)
+
+    url = state["url"]
     if not url:
         return None
+    rj = state["rj"]
+    password = state["password"]
     # 既没有 RJ 也没有解压码 → 不算规范格式，整行回退。
     if not rj and not password:
         return None
+    pass_code = state["pass_code"]
     url_pass_code = _pass_code_from_url(url)
     if not pass_code:
         pass_code = url_pass_code
@@ -197,6 +219,64 @@ def _parse_standard_line(line: str) -> Optional[Dict[str, str]]:
         "pass_code": pass_code,
         "extract_password": password,
     }
+
+
+def _parse_standard_line(line: str) -> Optional[Dict[str, str]]:
+    """解析一行规范格式（单行版本，保留给单元测试与单行调用方）。"""
+    return _parse_standard_segments(_split_segments(line))
+
+
+def _line_has_url(segments: Iterable[str]) -> bool:
+    for segment in segments:
+        if _URL_RE.search(str(segment or "")) or _BARE_URL_RE.search(str(segment or "")):
+            return True
+    return False
+
+
+def _segments_are_continuation(segments: Iterable[str]) -> bool:
+    """这一行是否是「上一行链接的续行」：只有解压码 / 提取码 / RJ，没有链接。"""
+    for segment in segments:
+        text = str(segment or "").strip()
+        if not text:
+            continue
+        if _EXTRACT_PASSWORD_LABEL_RE.search(text):
+            return True
+        if _PASS_CODE_LABEL_RE.search(text):
+            return True
+        if _RJ_HEAD_RE.match(text):
+            return True
+    return False
+
+
+def _group_standard_records(lines: Iterable[str]) -> List[Dict[str, Any]]:
+    """把「链接行 + 紧随其后的解压码/RJ 续行」合成一条记录。
+
+    粘贴多行时用户常按「链接一行、解压码一行、RJ 一行」排版；旧实现逐行解析，
+    单独的解压码行与 RJ 行既没有链接也没有上下文，会被判成「非规范格式」直接
+    退回，导致整段 hint 为空 —— 预览还能靠文件名标签兜底，起任务阶段没有兜底，
+    密码就此丢失。这里把续行并入最近的链接行（链接尚未出现时挂到下一行）。
+    """
+    records: List[Dict[str, Any]] = []
+    pending: List[str] = []
+    for line in lines:
+        segments = _split_segments(line)
+        if not segments:
+            continue
+        if _line_has_url(segments):
+            records.append({"segments": pending + segments, "has_url": True})
+            pending = []
+            continue
+        if _segments_are_continuation(segments) and records and records[-1]["has_url"]:
+            records[-1]["segments"].extend(segments)
+            continue
+        if _segments_are_continuation(segments):
+            # 链接还没出现：先攒着，等下一行链接一起解析（否则上下文丢失）。
+            pending.extend(segments)
+            continue
+        records.append({"segments": segments, "has_url": False})
+    if pending:
+        records.append({"segments": pending, "has_url": False})
+    return records
 
 
 def _legacy_line_urls(line: str) -> List[str]:
@@ -229,10 +309,12 @@ def parse_standard_input(
     hints: Dict[str, Dict[str, str]] = {}
     matched = False
 
-    for line in lines:
-        parsed = _parse_standard_line(line)
+    for record in _group_standard_records(lines):
+        segments = list(record.get("segments") or [])
+        parsed = _parse_standard_segments(segments)
         if not parsed:
-            for url in _legacy_line_urls(line):
+            # 未命中规范格式：整条记录交给既有识别，只取链接、不改行为。
+            for url in _legacy_line_urls(" ".join(segments)):
                 if url and url not in urls:
                     urls.append(url)
             continue
