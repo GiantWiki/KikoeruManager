@@ -34,6 +34,7 @@ from .google_drive_oauth import (
     resolve_google_drive_oauth_proxy_url,
 )
 from .log_sanitizer import sanitize_text_for_log
+from .password_utils import name_has_password_marker
 from .resource_budget_service import get_resource_budget_service
 
 logger = logging.getLogger(__name__)
@@ -5108,7 +5109,10 @@ class HttpDownloadService:
     def _filename_with_extract_password(self, name: str, password: str, ext: str = "") -> str:
         safe_name = self._sanitize_filename(name, "download")
         safe_password = self._sanitize_filename(password, "")
-        if safe_password:
+        # 幂等：名字里已经带过密码标记时不再追加。重试（重试行可能已含
+        # ``(pwd)`` 主体）会二次套模板，典型症状是 ``RJ01690838(aiyu)``
+        # 变成 ``RJ01690838(aiyu)(aiyu)``。
+        if safe_password and not name_has_password_marker(safe_name, safe_password):
             safe_name = self._render_filename_password_template(safe_name, safe_password)
         return f"{safe_name}{ext or ''}"
 

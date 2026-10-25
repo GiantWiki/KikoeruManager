@@ -67,6 +67,7 @@ _LABEL_ONLY_RE = re.compile(
 _ARCHIVE_SUFFIX_RES = (
     re.compile(r"\.part\d+\.(?:rar|zip|7z|exe)$", re.IGNORECASE),
     re.compile(r"\.r\d{2}$", re.IGNORECASE),
+    re.compile(r"\.z\d{1,2}p$", re.IGNORECASE),
     re.compile(r"\.z\d{2}$", re.IGNORECASE),
     re.compile(r"\.(?:7z|zip)\.\d{3}$", re.IGNORECASE),
     re.compile(r"\.(?:zip|rar|7z|tar|gz|bz2|xz|tgz|tbz2|txz|iso|exe)$", re.IGNORECASE),
@@ -117,6 +118,38 @@ def _strip_archive_suffix(value: str) -> str:
         if not stripped:
             break
     return text
+
+
+def strip_archive_suffix(value: str) -> str:
+    """剥掉文本尾部的归档后缀（``abc.zip`` / ``abc.7z.001`` / ``abc.z1p`` 等）。"""
+    return _strip_archive_suffix(normalize_password_value(value))
+
+
+# 密码标记的包裹形式：``name(pwd)`` / ``name[pwd]`` / ``name-pwd`` 等。
+_PASSWORD_MARKER_WRAPPERS = (
+    ("(", ")"),
+    ("（", "）"),
+    ("[", "]"),
+    ("［", "］"),
+    ("【", "】"),
+    ("{", "}"),
+    ("-", ""),
+    ("_", ""),
+    (" ", ""),
+)
+
+
+def name_has_password_marker(name: Optional[str], password: Optional[str]) -> bool:
+    """文件名尾部是否已经带过密码标记。
+
+    模板渲染幂等性的唯一判据：重试 / 二次标准化会重复套模板，典型症状是
+    ``RJ01690838(aiyu)`` 变成 ``RJ01690838(aiyu)(aiyu)``。
+    """
+    text = str(name or "").strip()
+    token = str(password or "").strip()
+    if not text or not token:
+        return False
+    return any(text.endswith(f"{left}{token}{right}") for left, right in _PASSWORD_MARKER_WRAPPERS)
 
 
 def extract_labeled_password(text: Optional[str]) -> str:

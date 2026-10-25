@@ -5968,3 +5968,23 @@ async def test_gofile_wrong_token_stops_without_unbounded_retry(monkeypatch, tmp
     with pytest.raises(HttpDownloadError, match="error-wrongToken" if configured else "新建的访客 token"):
         await service._collect_gofile_files("https://gofile.io/d/content-id")
     assert len(calls) == (1 if configured else 4)
+
+
+def test_filename_with_extract_password_is_idempotent():
+    """重试行主体已带密码标记时不能再套一次模板（RJ…(10221)(10221)）。"""
+    service = HttpDownloadService()
+    assert service._filename_with_extract_password("RJ01607138", "10221", ".z1p") == "RJ01607138(10221).z1p"
+    assert service._filename_with_extract_password("RJ01607138(10221)", "10221", ".z1p") == "RJ01607138(10221).z1p"
+    assert service._filename_with_extract_password("RJ01607138（10221）", "10221", ".z1p") == "RJ01607138（10221）.z1p"
+
+
+def test_apply_custom_download_name_does_not_double_append_password():
+    service = HttpDownloadService()
+    item = {
+        "name": "RJ01607138(10221).z1p",
+        "relative_path": "RJ01607138(10221).z1p",
+        "custom_name": "RJ01607138(10221)",
+        "custom_extract_password": "10221",
+    }
+    target = service._apply_custom_download_name_to_item(item)
+    assert target["filename"] == "RJ01607138(10221).z1p"
