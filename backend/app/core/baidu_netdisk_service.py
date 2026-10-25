@@ -33,6 +33,7 @@ from .fs_utils import move_path_efficient
 from .http_download_service import sanitize_http_download_item
 from .log_sanitizer import sanitize_text_for_log
 from .netdisk_link_parser import extract_share_inputs as parse_netdisk_share_inputs
+from .password_utils import name_has_password_marker
 from .resource_budget_service import get_resource_budget_service
 
 logger = logging.getLogger(__name__)
@@ -274,6 +275,94 @@ def sanitize_baidu_netdisk_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(item, dict)
             ]
     return out
+
+
+# 预览展示串里的密码段：``RJ01607138(10221).z1p`` -> ``10221``。
+# 判据与前端 passwordFromNameHint 保持一致（HttpDownloadPanel.vue）。
+_NAME_HINT_PASSWORD_RE = re.compile(r"\(([^()]+)\)(?=\.[A-Za-z0-9.]+$|$)")
+_PREVIEW_FILE_SECRET_FIELDS = ("custom_extract_password", "extract_password")
+
+
+def password_from_preview_name_hint(hint: Any) -> str:
+    """从 ``name_hint`` 反解解压密码；没有则空串。"""
+    text = str(hint or "").strip()
+    if not text:
+        return ""
+    match = _NAME_HINT_PASSWORD_RE.search(text)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _preview_file_identity_keys(row: Dict[str, Any]) -> List[str]:
+    """预览行的多键身份：fs_id / 远端路径 / 相对路径 / 文件名。"""
+    if not isinstance(row, dict):
+        return []
+    candidates = (
+        row.get("fs_id"),
+        row.get("fsid"),
+        row.get("path"),
+        row.get("remote_path"),
+        row.get("relative_path"),
+        row.get("original_relative_path"),
+        row.get("name"),
+        row.get("filename"),
+        row.get("original_name"),
+    )
+    keys: List[str] = []
+    for value in candidates:
+        text = str(value or "").strip().replace("\\", "/").strip("/")
+        if text and text not in keys:
+            keys.append(text)
+    return keys
+
+
+def carry_over_preview_file_secrets(incoming: Any, server_rows: Any) -> List[Dict[str, Any]]:
+    """把服务端预览行里已知的解压密码补回前端回传的行（只填空位）。
+
+    ``sanitize_baidu_netdisk_preview`` 会把 ``custom_extract_password`` 从下发
+    前端的预览里剥掉，前端 ``selected_items`` 回传时该字段必然为空。起任务阶段
+    若拿它整组覆盖服务端预览行，密码就丢了 —— 典型症状是预览显示
+    ``RJ01607138(10221).z1p``、落地却是 ``RJ01607138.z1p``。
+
+    这里按行身份合并：前端显式给了密码就以前端为准（用户手改），否则沿用
+    服务端值；两边都没有时再从 ``name_hint`` 反解，保证不依赖规范输入行。
+    """
+    if not isinstance(incoming, list):
+        return []
+    rows = [row for row in incoming if isinstance(row, dict)]
+    if not rows:
+        return list(incoming)
+    index: Dict[str, Dict[str, Any]] = {}
+    for peer_row in list(server_rows or []):
+        if not isinstance(peer_row, dict):
+            continue
+        for key in _preview_file_identity_keys(peer_row):
+            index.setdefault(key, peer_row)
+    merged_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        next_row = dict(row)
+        peer = next(
+            (index[key] for key in _preview_file_identity_keys(next_row) if key in index),
+            None,
+        )
+        if peer is not None:
+            for field in _PREVIEW_FILE_SECRET_FIELDS:
+                if str(next_row.get(field) or "").strip():
+                    continue
+                value = str(peer.get(field) or "").strip()
+                if value:
+                    next_row[field] = value
+            if not str(next_row.get("name_hint") or "").strip():
+                hint = str(peer.get("name_hint") or "").strip()
+                if hint:
+                    next_row["name_hint"] = hint
+        if not str(next_row.get("custom_extract_password") or next_row.get("extract_password") or "").strip():
+            recovered = password_from_preview_name_hint(next_row.get("name_hint"))
+            if recovered:
+                next_row["custom_extract_password"] = recovered
+        merged_rows.append(next_row)
+    return merged_rows
 
 
 def build_baidu_netdisk_batch_title(metadata: Dict[str, Any], item_count: int = 0) -> str:
@@ -799,7 +888,15 @@ class BaiduNetdiskService:
             merged = dict(item)
             overrides = selected_overrides.get(key) or {}
             if overrides:
+                server_preview_files = list(merged.get("preview_files") or [])
                 merged.update(overrides)
+                # 前端回传的预览行已被 sanitize 剥掉密码，直接覆盖会把
+                # 「预览带密码、落地不带」带进下载阶段，必须按行补回。
+                for files_key in ("preview_files", "share_files"):
+                    if files_key in overrides:
+                        merged[files_key] = carry_over_preview_file_secrets(
+                            merged.get(files_key), server_preview_files
+                        )
             items.append(merged)
         out["items"] = items
         ok_count = sum(1 for item in items if item.get("ok"))
@@ -3475,22 +3572,7 @@ class BaiduNetdiskService:
 
     @staticmethod
     def _name_has_password_marker(name: str, password: str) -> bool:
-        text = str(name or "").strip()
-        token = str(password or "").strip()
-        if not text or not token:
-            return False
-        wrappers = (
-            ("(", ")"),
-            ("（", "）"),
-            ("[", "]"),
-            ("［", "］"),
-            ("【", "】"),
-            ("{", "}"),
-            ("-", ""),
-            ("_", ""),
-            (" ", ""),
-        )
-        return any(text.endswith(f"{left}{token}{right}") for left, right in wrappers)
+        return name_has_password_marker(name, password)
 
     def _render_filename_password_template(self, name: str, password: str) -> str:
         extract_config = getattr(get_config(), "extract", None)

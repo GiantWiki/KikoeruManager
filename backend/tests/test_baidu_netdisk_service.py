@@ -2790,3 +2790,103 @@ def test_baidu_retry_share_file_uses_original_name_not_renamed_name():
     [row] = service._apply_custom_download_name_to_rows(item, [row])
 
     assert row["name"] == "RJ01690838(aiyu).mp3"
+
+
+def test_baidu_filter_preview_selection_recovers_password_stripped_by_sanitize(monkeypatch):
+    """前端回传的 preview_files 已被 sanitize 剥掉密码，不得覆盖服务端已知值。
+
+    回归：预览显示 RJ01607138(10221).z1p，落地却是 RJ01607138.z1p。
+    """
+    service = BaiduNetdiskService()
+    config = DummyConfig()
+    config.extract = type("ExtractConfig", (), {
+        "filename_password_sniff_templates": ["{name}({password})"],
+    })()
+    monkeypatch.setattr("app.core.baidu_netdisk_service.get_config", lambda: config)
+
+    preview = {
+        "items": [{
+            "ok": True,
+            "selection_key": "baidu:item",
+            "share_id": "share-id",
+            "share_url": "https://pan.baidu.com/s/abc?pwd=8g8r",
+            "name": "解压码10221.z1p",
+            "preview_files": [{
+                "name": "解压码10221.z1p",
+                "relative_path": "解压码10221.z1p",
+                "path": "/上传/解压码10221.z1p",
+                "fs_id": "258831144264751",
+                "custom_name": "RJ01607138",
+                "custom_extract_password": "10221",
+                "name_hint": "RJ01607138(10221).z1p",
+            }],
+        }],
+    }
+    forwarded = {
+        "selection_key": "baidu:item",
+        "share_url": "https://pan.baidu.com/s/abc?pwd=8g8r",
+        "name": "解压码10221.z1p",
+        "preview_files": [{
+            "name": "解压码10221.z1p",
+            "relative_path": "解压码10221.z1p",
+            "path": "/上传/解压码10221.z1p",
+            "fs_id": "258831144264751",
+            "custom_name": "RJ01607138",
+            "name_hint": "RJ01607138(10221).z1p",
+            "has_extract_password": True,
+        }],
+    }
+
+    filtered = service.filter_preview_selection(
+        preview,
+        selected_keys=["baidu:item"],
+        selected_items=[forwarded],
+    )
+    item = filtered["items"][0]
+    assert item["preview_files"][0]["custom_extract_password"] == "10221"
+    assert service._baidu_selected_file_overrides(item)["258831144264751"]["custom_extract_password"] == "10221"
+
+    [row] = service._apply_custom_download_name_to_rows(item, [{
+        "fs_id": "258831144264751",
+        "name": "解压码10221.z1p",
+        "relative_path": "解压码10221.z1p",
+        "original_name": "解压码10221.z1p",
+        "original_relative_path": "解压码10221.z1p",
+    }])
+    assert row["name"] == "RJ01607138(10221).z1p"
+
+
+def test_baidu_filter_preview_selection_recovers_password_from_name_hint_only():
+    """服务端行也没密码时，退回 name_hint 反解，兜住 hint 注入失效的场景。"""
+    service = BaiduNetdiskService()
+    preview = {
+        "items": [{
+            "ok": True,
+            "selection_key": "baidu:item",
+            "share_url": "https://pan.baidu.com/s/abc?pwd=8g8r",
+            "name": "解压码10222.z1p",
+            "preview_files": [{
+                "name": "解压码10222.z1p",
+                "relative_path": "解压码10222.z1p",
+                "fs_id": "76216631954793",
+                "name_hint": "RJ01696373(10222).z1p",
+            }],
+        }],
+    }
+    forwarded = {
+        "selection_key": "baidu:item",
+        "preview_files": [{
+            "name": "解压码10222.z1p",
+            "relative_path": "解压码10222.z1p",
+            "fs_id": "76216631954793",
+            "custom_name": "RJ01696373",
+            "name_hint": "RJ01696373(10222).z1p",
+        }],
+    }
+
+    filtered = service.filter_preview_selection(
+        preview,
+        selected_keys=["baidu:item"],
+        selected_items=[forwarded],
+    )
+    assert filtered["items"][0]["preview_files"][0]["custom_extract_password"] == "10222"
