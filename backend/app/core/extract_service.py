@@ -6745,7 +6745,11 @@ class ExtractService:
             pattern_parts.append(re.escape(raw[cursor:match.start()]))
             key = match.group(1)
             if key == "name":
-                pattern_parts.append(r"(?P<name>.+?)")
+                # 名字本身可能已经带括号后缀（网盘重名产生的 ``RJ01738799(1)``），
+                # 密码固定追加在末尾，所以 {name} 要贪婪吃到最后那个 "("，
+                # 否则 ``RJ01738799(1)(southplus@能代)`` 会嗅探出
+                # ``1)(southplus@能代`` 这种错密码。
+                pattern_parts.append(r"(?P<name>.+)")
             else:
                 pattern_parts.append(r"(?P<password>[^\\/]+?)")
             cursor = match.end()

@@ -2461,6 +2461,27 @@ class TestExtractService:
             extract_service.config.extract.filename_password_sniff_templates = old_templates
             extract_service.config.extract.filename_password_sniff_enabled = old_enabled
 
+    def test_filename_password_sniff_handles_name_own_parentheses(self, extract_service, temp_dir):
+        """名字自身带括号后缀时，{name}({password}) 必须只吃末尾的密码段。
+
+        回归：百度网盘目录分享落地成 RJ01738799(1)(southplus@能代)，
+        惰性匹配会解析出密码 1)(southplus@能代。
+        """
+        old_templates = extract_service.config.extract.filename_password_sniff_templates
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            extract_service.config.extract.filename_password_sniff_templates = ["{name}({password})"]
+
+            passwords = extract_service._get_filename_sniff_passwords(
+                os.path.join(temp_dir, "RJ01738799(1)(southplus@能代).part1.rar")
+            )
+            assert "southplus@能代" in passwords
+            assert not any("southplus@能代" in pw and pw != "southplus@能代" for pw in passwords)
+        finally:
+            extract_service.config.extract.filename_password_sniff_templates = old_templates
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
     def test_normalize_filename_preserves_download_password_suffix(self, extract_service):
         """监听器规范化 RJ 文件名时不能删除下载工作台写入的密码后缀。"""
         old_templates = extract_service.config.extract.filename_password_sniff_templates
