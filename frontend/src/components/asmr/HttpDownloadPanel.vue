@@ -1812,7 +1812,7 @@ function passwordFromNameHint(hint) {
   return match ? match[1] : ''
 }
 
-function customPreviewForTreeRow(row) {
+function customPreviewForTreeRow(row, { ignoreNameHint = false } = {}) {
   if (!row?.ok) return ''
   if (row.isDir) {
     if (!row.volumeGroup) return ''
@@ -1834,7 +1834,10 @@ function customPreviewForTreeRow(row) {
   const serverHint = String(file.name_hint || item.name_hint || '').trim()
   // 服务端已算好「原件名 + (密码) + 扩展名」，但它不把密码下发给前端；
   // 用户手动改过密码（本地有值）时仍走下面的实时计算，保证输入即时可见。
-  if (serverHint && !localPassword) return serverHint
+  // 同理，用户手动改过名字（ignoreNameHint）时不能再回落到服务端 hint，
+  // 否则保存后界面一直显示改名前的旧串。
+  if (serverHint && !localPassword && !ignoreNameHint) return serverHint
+
   const customName = String(file.custom_name || item.custom_name || '').trim()
   const customPassword = localPassword
   if (!customName && !customPassword) return ''
@@ -1999,14 +2002,18 @@ function applyTreeRowRename(row, name) {
   if (!row || !cleanName) return
   if (row.isDir && row.volumeGroup) {
     applyVolumeGroupNaming(row, { name: cleanName, keepPassword: true })
+    row.volumeGroup.files.forEach(entry => clearPreviewRowNameHint(entry?.row))
+    refreshPreviewTreeRowDisplay(row, { ignoreNameHint: true })
     addPreviewLog(`已重命名连续分卷为 ${cleanName}${volumeGroupDisplayPattern(row.volumeGroup)}`, 'success')
     return
   }
+  clearPreviewRowNameHint(row)
   if (isBaidu.value && row.file && row.file !== row.item) {
     row.file.custom_name = cleanName
   } else if (row.item) {
     row.item.custom_name = cleanName
   }
+  refreshPreviewTreeRowDisplay(row, { ignoreNameHint: true })
   addPreviewLog(`已重命名 ${row.name}`, 'success')
 }
 
@@ -2015,6 +2022,7 @@ function applyTreeRowPassword(row, password) {
   if (!row) return
   if (row.isDir && row.volumeGroup) {
     applyVolumeGroupNaming(row, { password: cleanPassword, keepName: true })
+    refreshPreviewTreeRowDisplay(row)
     addPreviewLog(cleanPassword ? `已为连续分卷设置密码` : '已清除连续分卷密码', cleanPassword ? 'success' : 'warning')
     return
   }
@@ -2023,7 +2031,42 @@ function applyTreeRowPassword(row, password) {
   } else if (row.item) {
     row.item.custom_extract_password = cleanPassword
   }
+  refreshPreviewTreeRowDisplay(row, { ignoreNameHint: true })
   addPreviewLog(cleanPassword ? `已为 ${row.name} 设置密码` : `已清除 ${row.name} 的密码`, cleanPassword ? 'success' : 'warning')
+}
+
+// 改名/改密码只改了数据模型，树节点的 customPreview 是 decorate 时算好的静态串，
+// 必须显式重算，否则界面上「保存后没有任何反应」。预览树节点是 computed 的产物，
+// 改 item 深层字段不会让 computed 重算。
+function refreshPreviewTreeRowDisplay(row, { ignoreNameHint = false } = {}) {
+  if (!row) return
+  if (row.isDir && row.volumeGroup) {
+    row.volumeGroup.files.forEach(entry => {
+      const fileRow = entry?.row
+      if (!fileRow || fileRow === row || fileRow.isDir) return
+      fileRow.customPreview = customPreviewForTreeRow(fileRow, { ignoreNameHint })
+    })
+  }
+  row.customPreview = customPreviewForTreeRow(row, { ignoreNameHint })
+}
+
+// 服务端下发的 name_hint 是「原件名 + (密码)」的成品串，用户本地改名后它会一直
+// 盖住新名字（草稿持久化后再打开也一样）。清掉前先把 hint 里的密码落到本地字段，
+// 避免只改名就丢密码显示。
+function clearPreviewRowNameHint(row) {
+  if (!row) return
+  const item = row.item
+  const file = row.file && row.file !== row.item ? row.file : null
+  const hasPassword = String(item?.custom_extract_password || file?.custom_extract_password || '').trim()
+  if (!hasPassword) {
+    const hintPassword = passwordFromNameHint(file?.name_hint || item?.name_hint)
+    if (hintPassword) {
+      if (item) item.custom_extract_password = hintPassword
+      if (file) file.custom_extract_password = hintPassword
+    }
+  }
+  if (item) item.name_hint = ''
+  if (file) file.name_hint = ''
 }
 
 function applyVolumeGroupNaming(row, { name = '', password = '', keepName = false, keepPassword = false } = {}) {
