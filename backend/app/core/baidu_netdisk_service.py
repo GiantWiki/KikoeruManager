@@ -3247,18 +3247,25 @@ class BaiduNetdiskService:
             ]
             if not share_files:
                 raise BaiduNetdiskError(f"{item.get('filename') or item.get('name') or '百度网盘分享'} 没有可下载文件")
+            file_overrides = self._baidu_selected_file_overrides(item)
             item_rows: List[Dict[str, Any]] = []
             for file_index, share_file in enumerate(share_files):
                 if share_file.get("is_dir"):
                     expanded = await self._collect_share_folder_files(context, share_file)
+                    # 规范输入的密码写在「目录行」上，展开成子文件后 fs_id 全变，
+                    # 行级 override 再也匹配不到，落地目录名会丢 (解压码) 段。
+                    dir_rename = self._custom_dir_rename_target(share_file, file_overrides)
                     for child_index, child in enumerate(expanded):
-                        item_rows.append(self._download_row_from_share_file(
+                        row = self._download_row_from_share_file(
                             item,
                             child,
                             context,
                             f"{file_index}-{child_index}",
                             keep_share_root=multiple_selected_shares,
-                        ))
+                        )
+                        if dir_rename is not None:
+                            row = self._apply_custom_dir_rename_to_row(row, dir_rename)
+                        item_rows.append(row)
                     continue
                 item_rows.append(self._download_row_from_share_file(
                     item,
@@ -3409,6 +3416,10 @@ class BaiduNetdiskService:
         custom_password = str(item.get("custom_extract_password") or item.get("extract_password") or "").strip()
         if not custom_name and not custom_password:
             return rows
+        # 目录级改名已经在 _build_download_file_rows 里落到子行前缀上，不能再套一层
+        # group folder，否则会变成 base(pwd)/base(pwd)/文件。
+        if any(row.get("custom_dir_rename_applied") for row in rows):
+            return rows
         if len(rows) != 1:
             if bool(item.get("custom_group_folder")):
                 return self._apply_custom_group_folder_to_rows(rows, custom_name, custom_password)
@@ -3489,17 +3500,112 @@ class BaiduNetdiskService:
             next_rows.append(next_row)
         return next_rows
 
+    _FILE_OVERRIDE_KEY_FIELDS = (
+        "fs_id",
+        "remote_path",
+        "path",
+        "original_relative_path",
+        "relative_path",
+        "original_name",
+        "name",
+    )
+
+    def _match_file_override(
+        self,
+        row: Dict[str, Any],
+        overrides: Dict[str, Dict[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        """按行身份（fs_id / 远端路径 / 相对路径 / 文件名）在 file 级重命名表里找命中项。"""
+        if not isinstance(row, dict) or not overrides:
+            return None
+        for field in self._FILE_OVERRIDE_KEY_FIELDS:
+            key = str(row.get(field) or "").strip()
+            if not key:
+                continue
+            hit = overrides.get(key)
+            if hit:
+                return hit
+        return None
+
+    def _custom_dir_rename_target(
+        self,
+        folder: Dict[str, Any],
+        overrides: Dict[str, Dict[str, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """目录级重命名目标：把命中目录行的 file 级重命名套到目录名上。
+
+        规范输入的解压码只写到 ``preview_files`` 的目录行；``_collect_share_folder_files``
+        展开成子文件后 fs_id / 路径全变，``_apply_custom_file_override_to_row`` 永远匹配
+        不到，症状是落地目录名缺 ``(解压码)`` 段（``RJ01738799(1)`` 而不是
+        ``RJ01738799(1)(southplus@能代)``）。
+        """
+        if not isinstance(folder, dict):
+            return None
+        override = self._match_file_override(folder, overrides)
+        if not override:
+            return None
+        custom_name = str(override.get("custom_name") or override.get("custom_filename") or "").strip()
+        custom_password = str(
+            override.get("custom_extract_password") or override.get("extract_password") or ""
+        ).strip()
+        if not custom_name and not custom_password:
+            return None
+        folder_relative = str(folder.get("relative_path") or folder.get("name") or "").replace("\\", "/").strip("/")
+        target_relative = self._custom_download_relative_path(
+            {"custom_name": custom_name, "custom_extract_password": custom_password},
+            folder_relative,
+        )
+        target = str(target_relative or "").replace("\\", "/").strip("/")
+        if not target or target == folder_relative:
+            return None
+        prefixes = [
+            str(folder.get(key) or "").replace("\\", "/").strip("/")
+            for key in ("relative_path", "name")
+        ]
+        prefixes = [prefix for prefix in dict.fromkeys(prefixes) if prefix]
+        if not prefixes:
+            return None
+        return {
+            "prefixes": prefixes,
+            "target": target,
+            "password": custom_password,
+        }
+
+    def _apply_custom_dir_rename_to_row(
+        self,
+        row: Dict[str, Any],
+        rename: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """把目录级改名落到子行相对路径的目录前缀上；密码只用于解压，不改子文件名。"""
+        if not isinstance(row, dict) or not isinstance(rename, dict):
+            return row
+        target = str(rename.get("target") or "").replace("\\", "/").strip("/")
+        relative = str(row.get("relative_path") or "").replace("\\", "/").strip("/")
+        if not target or not relative:
+            return row
+        renamed = ""
+        for prefix in rename.get("prefixes") or []:
+            if relative == prefix:
+                renamed = target
+                break
+            if relative.startswith(f"{prefix}/"):
+                renamed = f"{target}{relative[len(prefix):]}"
+                break
+        if not renamed:
+            # 父目录已被 _strip_selected_share_root 剥掉：不新增层级，保持原结构。
+            return row
+        next_row = dict(row)
+        next_row["relative_path"] = renamed.replace("/", os.sep)
+        next_row["custom_dir_rename_applied"] = True
+        password = str(rename.get("password") or "").strip()
+        if password and not str(next_row.get("custom_extract_password") or "").strip():
+            next_row["custom_extract_password"] = password
+        return next_row
+
     def _apply_custom_file_override_to_row(self, row: Dict[str, Any], overrides: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
         if not isinstance(row, dict) or not overrides:
             return row
-        candidates = [
-            str(row.get("fs_id") or "").strip(),
-            str(row.get("remote_path") or row.get("path") or "").strip(),
-            str(row.get("original_relative_path") or "").strip(),
-            str(row.get("relative_path") or "").strip(),
-            str(row.get("original_name") or row.get("name") or "").strip(),
-        ]
-        override = next((overrides.get(key) for key in candidates if key and overrides.get(key)), None)
+        override = self._match_file_override(row, overrides)
         if not override:
             return row
         custom_name = str(override.get("custom_name") or override.get("custom_filename") or "").strip()

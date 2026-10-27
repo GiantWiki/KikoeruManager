@@ -2890,3 +2890,132 @@ def test_baidu_filter_preview_selection_recovers_password_from_name_hint_only():
         selected_items=[forwarded],
     )
     assert filtered["items"][0]["preview_files"][0]["custom_extract_password"] == "10222"
+
+
+def _baidu_dir_share_item(password, folder_name="RJ01738799(1)", extra_preview=None):
+    preview = {
+        "name": folder_name,
+        "relative_path": folder_name,
+        "path": f"/{folder_name}",
+        "fs_id": "111",
+        "is_dir": True,
+    }
+    if password:
+        preview["custom_extract_password"] = password
+    preview.update(extra_preview or {})
+    return {
+        "filename": "RJ01738799",
+        "share_url": "https://pan.baidu.com/s/10hxCzHQ52d30Zapi80EtLA",
+        "selection_key": "baidu:item",
+        "preview_files": [preview],
+    }
+
+
+async def _baidu_dir_share_rows(service, monkeypatch, item, folder_name="RJ01738799(1)"):
+    async def fake_context(_item):
+        return {}
+
+    async def fake_collect(_context, _folder, _depth=0):
+        return [
+            {
+                "name": f"{folder_name}.part1.rar",
+                "relative_path": f"{folder_name}/{folder_name}.part1.rar",
+                "path": f"/{folder_name}/{folder_name}.part1.rar",
+                "fs_id": "222",
+                "size": 10,
+            },
+            {
+                "name": f"{folder_name}.part2.rar",
+                "relative_path": f"{folder_name}/{folder_name}.part2.rar",
+                "path": f"/{folder_name}/{folder_name}.part2.rar",
+                "fs_id": "333",
+                "size": 10,
+            },
+        ]
+
+    monkeypatch.setattr(service, "_share_download_context", fake_context)
+    monkeypatch.setattr(service, "_collect_share_folder_files", fake_collect)
+    return await service._build_download_file_rows([item])
+
+
+@pytest.mark.asyncio
+async def test_baidu_dir_share_applies_extract_password_to_folder_name(monkeypatch):
+    """目录分享：密码写在目录行上，展开成子文件后仍要落到目录名。
+
+    回归：规范输入 RJ01738799（解压码 southplus@能代）落地成 RJ01738799(1)，
+    预览却显示 RJ01738799(1)(southplus@能代)。
+    """
+    service = BaiduNetdiskService()
+    monkeypatch.setattr("app.core.baidu_netdisk_service.get_config", lambda: DummyConfig())
+
+    rows = await _baidu_dir_share_rows(
+        service,
+        monkeypatch,
+        _baidu_dir_share_item("southplus@能代"),
+    )
+
+    assert [row["relative_path"] for row in rows] == [
+        os.path.join("RJ01738799(1)(southplus@能代)", "RJ01738799(1).part1.rar"),
+        os.path.join("RJ01738799(1)(southplus@能代)", "RJ01738799(1).part2.rar"),
+    ]
+    assert [row["custom_extract_password"] for row in rows] == ["southplus@能代", "southplus@能代"]
+    # 密码只上移到目录名，不能连带把子文件也改名。
+    assert [row["name"] for row in rows] == ["RJ01738799(1).part1.rar", "RJ01738799(1).part2.rar"]
+    assert all(not row.get("custom_name") for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_baidu_dir_share_rename_is_idempotent(monkeypatch):
+    """目录名已带密码标记时不得再追加一次。"""
+    service = BaiduNetdiskService()
+    monkeypatch.setattr("app.core.baidu_netdisk_service.get_config", lambda: DummyConfig())
+    folder_name = "RJ01738799(1)(southplus@能代)"
+
+    rows = await _baidu_dir_share_rows(
+        service,
+        monkeypatch,
+        _baidu_dir_share_item("southplus@能代", folder_name=folder_name),
+        folder_name=folder_name,
+    )
+
+    assert [row["relative_path"] for row in rows] == [
+        os.path.join(folder_name, f"{folder_name}.part1.rar"),
+        os.path.join(folder_name, f"{folder_name}.part2.rar"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_baidu_dir_share_without_password_keeps_folder_name(monkeypatch):
+    """目录行没有密码/自定义名时保持原目录结构。"""
+    service = BaiduNetdiskService()
+    monkeypatch.setattr("app.core.baidu_netdisk_service.get_config", lambda: DummyConfig())
+
+    rows = await _baidu_dir_share_rows(
+        service,
+        monkeypatch,
+        _baidu_dir_share_item(""),
+    )
+
+    assert [row["relative_path"] for row in rows] == [
+        os.path.join("RJ01738799(1)", "RJ01738799(1).part1.rar"),
+        os.path.join("RJ01738799(1)", "RJ01738799(1).part2.rar"),
+    ]
+    assert all(not row.get("custom_extract_password") for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_baidu_dir_share_does_not_double_wrap_group_folder(monkeypatch):
+    """目录级改名已生效时，不能再套一层 custom_group_folder。"""
+    service = BaiduNetdiskService()
+    monkeypatch.setattr("app.core.baidu_netdisk_service.get_config", lambda: DummyConfig())
+
+    item = _baidu_dir_share_item("southplus@能代")
+    item["custom_name"] = "RJ01738799"
+    item["custom_group_folder"] = True
+
+    rows = await _baidu_dir_share_rows(service, monkeypatch, item)
+
+    assert [row["relative_path"] for row in rows] == [
+        os.path.join("RJ01738799(1)(southplus@能代)", "RJ01738799(1).part1.rar"),
+        os.path.join("RJ01738799(1)(southplus@能代)", "RJ01738799(1).part2.rar"),
+    ]
