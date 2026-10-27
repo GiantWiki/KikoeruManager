@@ -2,6 +2,16 @@
 
 本文件记录 KikoeruManager 的版本变化、功能更新与问题修复。更早的历史版本可通过 GitHub Tags 与提交历史查看。
 
+## v2.6.63（2026-10-27）
+
+### 修复
+- **百度网盘目录分享：解压码写在文件夹上时，落地目录名丢掉 `(解压码)` 段**：规范输入 `RJ01738799 | https://pan.baidu.com/s/… | 提取码: xd6d | 解压码: southplus@能代`，分享根是个名为 `RJ01738799(1)` 的文件夹，预览显示 `RJ01738799(1)(southplus@能代)`，实际落地却只有 `RJ01738799(1)`。原因是规范输入把密码写到 `preview_files` 的**目录行**上，而 `_build_download_file_rows` 会对目录条目调用 `_collect_share_folder_files` 展开，子文件的 `fs_id`、`relative_path` 全部换成新值；随后 `_apply_custom_file_override_to_row` 按 fs_id / 远端路径 / 相对路径 / 文件名去匹配 override，永远命不中那一行目录。item 级 `custom_extract_password` 本身为空，`_apply_custom_download_name_to_rows` 直接返回，于是子文件保持原名、目录名也拿不到密码段。分享根是单个压缩包时 fs_id 不变、能命中，所以此前的修复没有覆盖目录分享。现在展开前先算出目录级改名目标，展开后套到子行相对路径的目录前缀上，并把密码下发给子行供解压链路使用；同时加了保护：目录级改名已生效时不再叠加 `custom_group_folder`，否则会变成 `base(pwd)/base(pwd)/文件` 的双层目录。自 v2.6.52（预览名称提示与规范输入解析上线）起受影响。
+- **预览面板右键「重命名」保存后界面没有任何反应**：`applyTreeRowRename` 只改了 `item.custom_name`，而列表显示的是 `decoratePreviewDirNode` 在 computed 里算好的静态串 `customPreview`，改深层字段不会让 computed 重算，看起来就是"点了保存但没变化"。单文件行还有第二层遮蔽——`customPreviewForTreeRow` 优先返回服务端下发的 `name_hint`（改名前的旧串），本地新名字被直接盖掉。现在改名 / 改密码后会显式重算目录行与分卷组内各行的 `customPreview`，本地改过名就不再回落 `name_hint`；清 `name_hint` 前先把 hint 里的密码落到 `custom_extract_password`，避免"只改名却丢密码显示"，也避免草稿持久化后重新打开又变回旧名。自 v2.6.52 起受影响。
+- **文件名密码嗅探把带括号的目录名解析成错误密码**：`{name}({password})` 模板里 `{name}` 原为惰性匹配 `.+?`，`RJ01738799(1)(southplus@能代)` 会解析出密码 `1)(southplus@能代`，父目录名带密码时整个嗅探候选都是废的。改为贪婪 `.+` 后正确解析为 `name=RJ01738799(1)`、`password=southplus@能代`。该模板自 v1.5.1 起存在此问题，只是此前目录名很少带密码后缀，本次修复后才成为主路径。
+
+### 测试
+- 新增无数据库回归覆盖：目录分享的解压码必须落到目录名且不连带修改子文件名、目录名已带密码标记时幂等不重复追加、目录行没有密码时保持原目录结构、目录级改名不与 group folder 叠加。
+
 ## v2.6.62（2026-10-25）
 
 ### 修复
