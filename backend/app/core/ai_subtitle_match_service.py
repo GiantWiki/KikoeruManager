@@ -307,10 +307,19 @@ def _collect_text_fields(container: Any) -> Dict[str, str]:
         items = container.items()
     else:
         raw = getattr(container, "__dict__", None)
-        if isinstance(raw, dict) and raw:
-            items = raw.items()
+        extra = getattr(container, "__pydantic_extra__", None)
+        fields: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            fields.update(raw)
+        if isinstance(extra, dict):
+            # pydantic v2 的 extra='allow' 字段不进入 __dict__。litellm 1.106
+            # 的 Delta 正是把 content 等正文放在这里，__dict__ 只有值为 None
+            # 的声明字段；两个来源必须合并，且不能用 model_dump() 逐分片序列化。
+            fields.update(extra)
+        if fields:
+            items = fields.items()
         else:
-            # pydantic / litellm 模型对象：按已知字段名探测属性。
+            # 非 pydantic 模型对象：保留按已知字段名探测属性的兜底。
             items = ((key, getattr(container, key, None)) for key in _PRIMARY_TEXT_KEYS)
 
     collected: Dict[str, str] = {}

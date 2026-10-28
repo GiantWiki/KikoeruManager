@@ -149,6 +149,29 @@ def _install_fake_litellm_stream(monkeypatch: pytest.MonkeyPatch, chunks: list) 
     monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(acompletion=acompletion))
 
 
+class _FakePydanticExtraDelta:
+    """复刻 litellm 1.106 Delta：正文在 extra，__dict__ 只有值为 None 的声明字段。"""
+
+    def __init__(self, **extra):
+        self.reasoning_content = None
+        self.thinking_blocks = None
+        self.reasoning_items = None
+        self.provider_specific_fields = None
+        self.__pydantic_extra__ = dict(extra)
+
+    def __getattr__(self, name):
+        # pydantic v2 在常规属性查找失败后，从 __pydantic_extra__ 取扩展字段。
+        extra = object.__getattribute__(self, "__pydantic_extra__")
+        try:
+            return extra[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _object_delta_chunk(delta, *, finish_reason: str = "") -> dict:
+    return {"choices": [{"delta": delta, "finish_reason": finish_reason}]}
+
+
 def test_extract_verbose_picks_reasoning_when_content_empty():
     from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
 
@@ -176,6 +199,45 @@ def test_extract_verbose_prefers_content_over_reasoning():
     primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(chunk)
     assert primary == "正文"
     assert collected["reasoning_content"] == "思考"
+
+
+def test_extract_verbose_reads_content_from_pydantic_extra():
+    """litellm 1.106 的 content 不在 __dict__，不能只遍历声明字段。"""
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    delta = _FakePydanticExtraDelta(content="[繁體中文版] 標題", role="assistant")
+    primary, collected, _usage, reason = extract_litellm_stream_delta_verbose(
+        _object_delta_chunk(delta, finish_reason="stop")
+    )
+    assert primary == "[繁體中文版] 標題"
+    assert collected == {"content": "[繁體中文版] 標題"}
+    assert reason == "stop"
+
+
+def test_extract_verbose_reads_unknown_custom_field_from_pydantic_extra():
+    """extra 中的自定义字段也要保留，不能退化成只探测固定字段名。"""
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    delta = _FakePydanticExtraDelta(answer_text="自定义 extra 正文")
+    primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(
+        _object_delta_chunk(delta)
+    )
+    assert primary == "自定义 extra 正文"
+    assert collected == {"answer_text": "自定义 extra 正文"}
+
+
+@pytest.mark.asyncio
+async def test_stream_translation_accepts_pydantic_extra_content(monkeypatch):
+    """完整流式链路不能再把 extra 中的正文误判成「未解析到任何文本字段」。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _object_delta_chunk(_FakePydanticExtraDelta(content="翻译后的")),
+        _object_delta_chunk(_FakePydanticExtraDelta(content="标题")),
+        _object_delta_chunk(_FakePydanticExtraDelta(), finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config())
+    assert result["success"] is True, result
+    assert result["translated_title"] == "翻译后的标题"
 
 
 def test_exclude_structural_fields_from_text_collection():
