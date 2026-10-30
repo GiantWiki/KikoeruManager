@@ -984,6 +984,158 @@ class TestTaskEngine:
 
         assert engine._should_persist_task_snapshot(sample_task, version_key) is True
 
+    def _stub_dlsite_resume_finalizers(self, engine, monkeypatch):
+        monkeypatch.setattr(engine, "_notify_progress", AsyncMock())
+        monkeypatch.setattr(engine, "_write_task_runtime_to_redis", Mock())
+        monkeypatch.setattr(engine, "_archive_source_file", AsyncMock())
+        monkeypatch.setattr(engine, "_record_problem_work_for_task_failure", Mock())
+        monkeypatch.setattr(engine, "_remove_waiting_retry_task", Mock())
+        for name in (
+            "_resolve_retry_extract_conflict",
+            "_resolve_completed_failure_followups",
+            "_finalize_conflict_resolution_task",
+            "_finalize_reprocessed_archive",
+            "unmark_rjcode_processing",
+        ):
+            monkeypatch.setattr(engine, name, Mock())
+        monkeypatch.setattr(engine, "_cleanup_task_temp_extract_path", AsyncMock())
+        monkeypatch.setattr(engine, "_cleanup_failed_task", AsyncMock())
+        monkeypatch.setattr(
+            "app.core.circle_completion_service.get_circle_completion_service",
+            lambda: SimpleNamespace(sync_owned_for_rj=AsyncMock()),
+        )
+        monkeypatch.setattr("app.core.activity_log_service.log_task_lifecycle_event", Mock())
+        monkeypatch.setattr("app.core.task_notification_service.enqueue_notification_check", AsyncMock())
+        monkeypatch.setattr("app.core.task_center_event_service.broadcast_task_center_changed", Mock())
+
+    @pytest.mark.asyncio
+    async def test_dlsite_network_resume_reuses_output_and_skips_extract(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch,
+    ):
+        source = tmp_path / "RJ01689866(1029).7z"
+        source.write_bytes(b"archive")
+        output = tmp_path / "library" / "RJ01689866"
+        output.mkdir(parents=True)
+        (output / "track.wav").write_bytes(b"audio")
+        task = Task(
+            TaskType.AUTO_PROCESS,
+            str(source),
+            output_path=str(output),
+            task_id="task-dlsite-resume-success",
+            status=TaskStatus.WAITING_MANUAL,
+            metadata={
+                "rjcode": "RJ01689866",
+                "dlsite_network_paused": True,
+                "resume_from_stage": "dlsite_network",
+            },
+            rjcode="RJ01689866",
+        )
+        engine.tasks[task.id] = task
+        self._stub_dlsite_resume_finalizers(engine, monkeypatch)
+        monkeypatch.setattr(
+            settings_module,
+            "get_config",
+            lambda: SimpleNamespace(auto_process=SimpleNamespace(archive=True)),
+        )
+        fetch = AsyncMock(return_value={
+            "rjcode": "RJ01689866",
+            "work_name": "网络恢复后的完整标题",
+            "metadata_verification_status": "verified",
+        })
+        clear_failure = Mock()
+        monkeypatch.setattr("app.core.metadata_service.MetadataService.fetch", fetch)
+        monkeypatch.setattr("app.core.dlsite_service.clear_dlsite_transport_failure", clear_failure)
+        monkeypatch.setattr(engine, "_dlsite_transport_failure_reason", Mock(return_value=""))
+        extract = AsyncMock(side_effect=AssertionError("DLsite 续跑不能重新解压"))
+        classify = AsyncMock(side_effect=AssertionError("DLsite 续跑不能重新分类移动"))
+        monkeypatch.setattr("app.core.extract_service.ExtractService.extract", extract)
+        monkeypatch.setattr("app.core.classifier.SmartClassifier.classify_and_move", classify)
+
+        resumed = await engine.retry_dlsite_network_paused_task(task.id)
+        assert resumed is task
+        assert task.status == TaskStatus.PENDING
+        assert engine.queue.qsize() == 1
+        assert engine.queue.get_nowait() is task
+
+        await engine._process_task(task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.output_path == str(output)
+        assert (output / "track.wav").read_bytes() == b"audio"
+        assert "dlsite_network_paused" not in task.task_metadata
+        assert "resume_from_stage" not in task.task_metadata
+        assert task.task_metadata["work_name"] == "网络恢复后的完整标题"
+        fetch.assert_awaited_once_with(str(output), task, force_refresh=True)
+        clear_failure.assert_called_once_with()
+        engine._archive_source_file.assert_awaited_once_with(task)
+        extract.assert_not_awaited()
+        classify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeated_dlsite_network_retry_preserves_output_without_extract(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch,
+    ):
+        source = tmp_path / "RJ01689866(1029).7z"
+        source.write_bytes(b"archive")
+        output = tmp_path / "library" / "RJ01689866"
+        output.mkdir(parents=True)
+        (output / "track.wav").write_bytes(b"audio")
+        task = Task(
+            TaskType.AUTO_PROCESS,
+            str(source),
+            output_path=str(output),
+            task_id="task-dlsite-resume-still-offline",
+            status=TaskStatus.WAITING_MANUAL,
+            metadata={
+                "rjcode": "RJ01689866",
+                "dlsite_network_paused": True,
+                "resume_from_stage": "dlsite_network",
+            },
+            rjcode="RJ01689866",
+        )
+        engine.tasks[task.id] = task
+        self._stub_dlsite_resume_finalizers(engine, monkeypatch)
+        monkeypatch.setattr(
+            settings_module,
+            "get_config",
+            lambda: SimpleNamespace(auto_process=SimpleNamespace(archive=True)),
+        )
+        fetch = AsyncMock(return_value={
+            "rjcode": "RJ01689866",
+            "metadata_source": "minimal",
+        })
+        monkeypatch.setattr("app.core.metadata_service.MetadataService.fetch", fetch)
+        monkeypatch.setattr("app.core.dlsite_service.clear_dlsite_transport_failure", Mock())
+        monkeypatch.setattr(
+            engine,
+            "_dlsite_transport_failure_reason",
+            Mock(return_value="DNS 解析失败"),
+        )
+        extract = AsyncMock(side_effect=AssertionError("第二次重试也不能重新解压"))
+        monkeypatch.setattr("app.core.extract_service.ExtractService.extract", extract)
+
+        for expected_retry_count in (1, 2):
+            resumed = await engine.retry_dlsite_network_paused_task(task.id)
+            assert resumed is task
+            assert engine.queue.get_nowait() is task
+            await engine._process_task(task)
+            assert task.id == "task-dlsite-resume-still-offline"
+            assert task.status == TaskStatus.WAITING_MANUAL
+            assert task.task_metadata["dlsite_network_paused"] is True
+            assert task.task_metadata["dlsite_network_retry_count"] == expected_retry_count
+            assert task.output_path == str(output)
+            assert (output / "track.wav").read_bytes() == b"audio"
+
+        assert fetch.await_count == 2
+        extract.assert_not_awaited()
+        engine._archive_source_file.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_cleanup_failed_task_keeps_partial_download_batch_dir(tmp_path):

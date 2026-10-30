@@ -1105,6 +1105,10 @@ class TaskCenterService:
             actions.extend(["pause", "cancel"])
         elif task.status == TaskStatus.PAUSED:
             actions.extend(["resume", "cancel"])
+        elif task.status == TaskStatus.WAITING_MANUAL and bool(
+            (task.task_metadata or {}).get("dlsite_network_paused")
+        ):
+            actions.append("retry")
         elif domain == "ai_title" and task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             actions.extend(["rollback_ai_title", "delete"])
         elif domain in {"http_download", "baidu_netdisk"} and task.status == TaskStatus.COMPLETED and list((task.task_metadata or {}).get("failed_files") or []):
@@ -2522,6 +2526,14 @@ class TaskCenterService:
                     return {"success": True, "message": "任务已加入重试队列"}
                 raise ValueError("任务不在等待重试状态")
             if normalized_action == "retry":
+                if bool((task.task_metadata or {}).get("dlsite_network_paused")):
+                    resumed_task = await engine.retry_dlsite_network_paused_task(task.id)
+                    return {
+                        "success": True,
+                        "message": "已复用原任务和已有产物，从 DLsite 元数据阶段继续",
+                        "task_id": resumed_task.id,
+                        "route_hint": self.DOMAIN_ROUTE_HINT.get(self._infer_domain(resumed_task), "/tasks"),
+                    }
                 if self._infer_domain(task) == "http_download":
                     if task.status in {TaskStatus.PENDING, TaskStatus.PROCESSING, TaskStatus.PAUSED}:
                         raise ValueError("任务仍在执行中，不能重试")

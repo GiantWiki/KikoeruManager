@@ -333,3 +333,30 @@ async def test_duplicate_groups_without_excluded_libraries_ok(monkeypatch):
     assert resp is not None
     assert captured.get("groups") == []
     assert captured.get("total") == 0
+
+
+def test_duplicate_noise_entry_excludes_filter_recovery_but_keeps_normal_versions():
+    cached_dir = "filter-recovery/task-1/RJ01476998"
+    cached_file = "filter-recovery/task-1/RJ01476998/track.wav"
+
+    assert routes._duplicate_is_noise_entry(
+        cached_dir, "filter-recovery/task-1", "dir", "RJ01476998"
+    ) is True
+    assert routes._duplicate_is_noise_entry(
+        cached_file, "filter-recovery/task-1/RJ01476998", "file", "RJ01476998"
+    ) is True
+    assert routes._duplicate_is_noise_entry(
+        r"filter-recovery\task-1\RJ01476998",
+        r"filter-recovery\task-1",
+        "dir",
+        "RJ01476998",
+    ) is True
+    assert routes._duplicate_is_noise_entry(
+        "RJ01476998", "", "dir", "RJ01476998"
+    ) is False
+    assert routes._duplicate_is_noise_entry(
+        "filter-recovery-copy/RJ01476998",
+        "filter-recovery-copy",
+        "dir",
+        "RJ01476998",
+    ) is False

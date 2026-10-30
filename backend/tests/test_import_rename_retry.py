@@ -218,6 +218,7 @@ async def test_conflict_retry_builds_process_existing_task_for_rename_stage(tmp_
 
     submitted = []
     fake_engine = SimpleNamespace(
+        get_task=Mock(return_value=None),
         get_all_tasks=lambda: [],
         cleanup_retry_output_artifacts=Mock(
             side_effect=AssertionError("重命名断点重试不能清理解压产物")
@@ -244,3 +245,83 @@ async def test_conflict_retry_builds_process_existing_task_for_rename_stage(tmp_
     assert retry_task.task_metadata["rename_retry_classify_enabled"] is True
     assert retry_task.task_metadata["retry_failed_task_id"] == "failed-task-id"
     assert "failure_stage" not in retry_task.task_metadata
+
+
+@pytest.mark.asyncio
+async def test_conflict_retry_resumes_dlsite_network_task_without_recreating(tmp_path, monkeypatch):
+    source = tmp_path / "RJ01689866(1029).7z"
+    source.write_bytes(b"archive")
+    output = tmp_path / "library" / "RJ01689866"
+    output.mkdir(parents=True)
+    (output / "track.wav").write_bytes(b"audio")
+    original_task = Task(
+        TaskType.AUTO_PROCESS,
+        str(source),
+        output_path=str(output),
+        task_id="task-dlsite-original",
+        status=TaskStatus.WAITING_MANUAL,
+        metadata={
+            "rjcode": "RJ01689866",
+            "dlsite_network_paused": True,
+            "resume_from_stage": "dlsite_network",
+        },
+        rjcode="RJ01689866",
+    )
+    conflict = SimpleNamespace(
+        id="conflict-dlsite-network",
+        status="PENDING",
+        conflict_type="PROCESS_FAILED",
+        new_path=str(source),
+        new_metadata={
+            "failure_stage": "archive",
+            "source_task_type": TaskType.AUTO_PROCESS.value,
+            "dlsite_network_paused": True,
+        },
+        task_id=original_task.id,
+        rjcode="RJ01689866",
+    )
+
+    class FakeQuery:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return conflict
+
+    class FakeDb:
+        def query(self, *_args, **_kwargs):
+            return FakeQuery()
+
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+    retry = AsyncMock(return_value=original_task)
+    fake_engine = SimpleNamespace(
+        get_task=Mock(return_value=original_task),
+        get_all_tasks=Mock(side_effect=AssertionError("DLsite 续跑不应进入同源新任务检查")),
+        retry_dlsite_network_paused_task=retry,
+        cleanup_retry_output_artifacts=Mock(
+            side_effect=AssertionError("DLsite 续跑不能删除已有产物")
+        ),
+        submit=AsyncMock(side_effect=AssertionError("DLsite 续跑不能创建并提交新任务")),
+    )
+    monkeypatch.setattr(database_module, "get_db", lambda: iter([FakeDb()]))
+    monkeypatch.setattr(routes_module, "get_task_engine", lambda: fake_engine)
+
+    result = await routes_module.retry_extract_failed_conflict(conflict.id)
+
+    assert result["success"] is True
+    assert result["task_id"] == original_task.id
+    assert result["resumed_from_stage"] == "dlsite_network"
+    assert conflict.status == "PROCESSING"
+    assert conflict.task_id == original_task.id
+    assert conflict.new_metadata["resolution_task_id"] == original_task.id
+    assert original_task.task_metadata["retry_from_conflicts"] is True
+    assert original_task.task_metadata["conflict_resolution_conflict_id"] == conflict.id
+    retry.assert_awaited_once_with(original_task.id)
+    fake_engine.cleanup_retry_output_artifacts.assert_not_called()
+    fake_engine.submit.assert_not_awaited()
+    assert (output / "track.wav").read_bytes() == b"audio"

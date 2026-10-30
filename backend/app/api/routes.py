@@ -7716,6 +7716,39 @@ async def retry_extract_failed_conflict(conflict_id: str, payload: Optional[Conf
         ignore_garbled = bool(payload.ignore_garbled) if payload else False
 
         engine = get_task_engine()
+        failed_task = engine.get_task(failed_task_id) if failed_task_id else None
+        if failed_task and bool((failed_task.task_metadata or {}).get("dlsite_network_paused")):
+            resumed_task = await engine.retry_dlsite_network_paused_task(failed_task.id)
+            resumed_metadata = dict(resumed_task.task_metadata or {})
+            resumed_metadata.update({
+                "retry_conflict_id": conflict.id,
+                "retry_conflict_source_path": source_path,
+                "retry_conflict_type": conflict.conflict_type,
+                "retry_from_conflicts": True,
+                "conflict_resolution_conflict_id": conflict.id,
+                "conflict_resolution_action": "RETRY",
+            })
+            resumed_task.task_metadata = resumed_metadata
+            conflict.status = "PROCESSING"
+            conflict.task_id = resumed_task.id
+            next_metadata = dict(conflict.new_metadata or {})
+            next_metadata.update({
+                "resolution_task_state": "queued",
+                "resolution_action": "RETRY",
+                "resolution_requested_at": datetime.now().isoformat(),
+                "resolution_task_id": resumed_task.id,
+            })
+            next_metadata.pop("resolution_error", None)
+            conflict.new_metadata = next_metadata
+            db.commit()
+            return {
+                "success": True,
+                "message": "已复用原任务和已有产物，从 DLsite 元数据阶段继续",
+                "task_id": resumed_task.id,
+                "already_running": False,
+                "resumed_from_stage": "dlsite_network",
+            }
+
         normalized_source_path = os.path.normcase(os.path.normpath(source_path))
         existing_task = next(
             (
@@ -23655,17 +23688,22 @@ def _duplicate_version_root(relative_path: str, parent_path: Optional[str], entr
 
 # 与 library_index._helpers._RJ_PATTERN 同源，供 SQL 过滤噪声条目使用
 _DUPLICATE_NOISE_RJ_SQL_PATTERN = r"[rvb]j(\d{6,8})(?!\d)"
+_DUPLICATE_FILTER_RECOVERY_SQL_PATTERN = r"(^|/)filter-recovery(/|$)"
 
 
 def _duplicate_is_noise_entry(
     relative_path: str, parent_path: Optional[str], entry_type: str, rjcode: str
 ) -> bool:
-    """判断是否为查重噪声条目：RJ 号只出现在文件名、且文件嵌在其它作品目录内。
+    """判断是否为查重噪声条目：删除恢复缓存，或嵌在其它作品内的 RJ 散文件。
 
-    典型噪声：作品文件夹里的 @folder-icon-RJxxxx.ico、img/classic 下的宣传图。
-    这类散文件不是作品版本，却会因版本根回退把父目录（如 img/classic、
-    别人的作品文件夹）误判成一个版本；保留删除时还可能误伤其它作品。
+    典型噪声：filter-recovery 中等待恢复的删除内容、作品文件夹里的
+    @folder-icon-RJxxxx.ico、img/classic 下的宣传图。这些条目不是作品版本；
+    保留删除时也不应把恢复缓存或其它作品目录当成可操作版本。
     """
+    from ..core.library_index._helpers import extract_rjcode, is_filter_recovery_path
+
+    if is_filter_recovery_path(relative_path):
+        return True
     if entry_type != "file":
         return False
     rel = relative_path or ""
@@ -23676,8 +23714,6 @@ def _duplicate_is_noise_entry(
     parent = parent_path or ""
     if not parent:
         return False
-    from ..core.library_index._helpers import extract_rjcode
-
     return any(extract_rjcode(component) for component in parent.split("/"))
 
 # 语言标记按优先级互斥判定：简体 > 繁体 > 中文翻译 > 日文 > 英文
@@ -23746,6 +23782,11 @@ def _duplicate_collect_version_files(
         rows = (
             db.query(LibraryIndexEntry)
             .filter(LibraryIndexEntry.library_id == library_id)
+            .filter(
+                ~func.coalesce(LibraryIndexEntry.relative_path, "").op("~*")(
+                    _DUPLICATE_FILTER_RECOVERY_SQL_PATTERN
+                )
+            )
             .filter(LibraryIndexEntry.relative_path.startswith(prefix))
             .order_by(LibraryIndexEntry.relative_path)
             .limit(cap + 1)
@@ -23902,6 +23943,12 @@ def _get_duplicate_groups_page(page: int, page_size: int, sort: str, search: str
             )
             .filter(LibraryIndexEntry.rjcode.isnot(None))
             .filter(LibraryIndexEntry.rjcode != "")
+        )
+        # 删除恢复缓存即使已被旧版本索引，也不参与版本计数；无需等待全量重建索引。
+        base_q = base_q.filter(
+            ~func.coalesce(rel, "").op("~*")(
+                _DUPLICATE_FILTER_RECOVERY_SQL_PATTERN
+            )
         )
         # 排除库过滤必须在 base_q 定义之后（afa4086 曾把它插到定义之前，
         # 勾选「查重排除」后列表接口直接 UnboundLocalError 500）

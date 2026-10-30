@@ -756,15 +756,21 @@ async def test_restart_restore_respects_task_status(
         restarted.stop()
 
 
-def test_restart_restore_does_not_execute_legacy_unmarked_pending_task(monkeypatch):
-    """历史 pending 快照只允许保留，升级后不能突然自动执行。"""
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted_status", [TaskStatus.PENDING, TaskStatus.PROCESSING])
+async def test_restart_restore_shows_legacy_unmarked_task_without_executing(
+    monkeypatch,
+    persisted_status,
+):
+    """历史活动快照恢复为可见暂停任务，不能自动执行或伪装成运行中。"""
     TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    task_id = f"task-legacy-unmarked-{persisted_status.value}"
     db = TestingSessionLocal()
     try:
         db.add(TaskRecord(
-            id="task-legacy-unmarked-pending",
+            id=task_id,
             type=TaskType.EXTRACT.value,
-            status=TaskStatus.PENDING.value,
+            status=persisted_status.value,
             source_path="/tmp/legacy.zip",
             task_metadata={},
         ))
@@ -774,9 +780,26 @@ def test_restart_restore_does_not_execute_legacy_unmarked_pending_task(monkeypat
 
     engine = TaskEngine()
     try:
-        assert engine.load_persisted_queue_tasks() == 0
-        assert engine.get_task("task-legacy-unmarked-pending") is None
+        assert engine.load_persisted_queue_tasks() == 1
+        restored = engine.get_task(task_id)
+        assert restored is not None
+        assert restored.status == TaskStatus.PAUSED
+        assert restored.current_step == "历史任务已恢复，点击继续后执行"
+        assert restored.task_metadata["legacy_restore_requires_manual_resume"] is True
         assert engine.queue.qsize() == 0
+
+        service = TaskCenterService()
+        monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: engine)
+        _use_empty_non_engine_task_sources(monkeypatch, service)
+        listed = await service.list_items(mode="summary", limit=10)
+        assert listed["total"] == 1
+        assert listed["items"][0]["engine_task_id"] == task_id
+        assert listed["items"][0]["status"] == TaskStatus.PAUSED.value
+        assert listed["items"][0]["actions"] == ["resume", "cancel"]
+
+        engine.resume_task(task_id)
+        assert restored.status == TaskStatus.PENDING
+        assert engine.queue.qsize() == 1
     finally:
         engine.stop()
 
@@ -1165,3 +1188,44 @@ async def test_ai_title_rollback_action_persists_updated_snapshot(monkeypatch):
     assert result["restored_count"] == 2
     rollback.assert_awaited_once_with(task)
     engine.persist_task_snapshot.assert_called_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_dlsite_network_retry_reuses_original_engine_task(monkeypatch, tmp_path):
+    output = tmp_path / "RJ01689866"
+    output.mkdir()
+    task = Task(
+        TaskType.AUTO_PROCESS,
+        str(tmp_path / "RJ01689866.7z"),
+        output_path=str(output),
+        task_id="task-dlsite-network-paused",
+        status=TaskStatus.WAITING_MANUAL,
+        metadata={
+            "rjcode": "RJ01689866",
+            "dlsite_network_paused": True,
+            "resume_from_stage": "dlsite_network",
+        },
+        rjcode="RJ01689866",
+    )
+    service = TaskCenterService()
+    assert service._build_engine_actions(task, "import") == ["retry"]
+
+    retry = AsyncMock(return_value=task)
+    engine = SimpleNamespace(
+        get_task=Mock(return_value=task),
+        retry_dlsite_network_paused_task=retry,
+    )
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: engine)
+    file_processor = SimpleNamespace(
+        process_file=AsyncMock(side_effect=AssertionError("DLsite 续跑不能新建导入任务"))
+    )
+    monkeypatch.setattr("app.core.file_processor.get_file_processor", lambda: file_processor)
+
+    result = await service.execute_action(f"engine:{task.id}", "retry")
+
+    assert result["success"] is True
+    assert result["task_id"] == task.id
+    retry.assert_awaited_once_with(task.id)
+    file_processor.process_file.assert_not_awaited()
+    assert task.output_path == str(output)
+    assert output.is_dir()

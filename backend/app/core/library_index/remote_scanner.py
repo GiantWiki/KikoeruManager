@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any, AsyncIterator, Optional
 
-from ._helpers import extract_rjcode, should_skip_name
+from ._helpers import extract_rjcode, is_filter_recovery_path, should_skip_name
 from .types import IndexEntry
 
 logger = logging.getLogger(__name__)
@@ -336,6 +336,8 @@ class RemoteScanner:
             mtime_ms = mtime_seconds * 1000 if mtime_seconds else None
 
             relative = self._compute_relative(absolute_path, root_path)
+            if is_filter_recovery_path(relative):
+                return None
             parent = self._compute_parent(relative)
             depth = self._compute_depth(relative)
 

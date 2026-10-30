@@ -13,8 +13,9 @@ from typing import Optional
 
 # RJ 正则：与 library_manager._extract_rjcode 一致
 _RJ_PATTERN = re.compile(r"[RVB]J(?:\d{6,8})(?!\d)", re.IGNORECASE)
-# 跳过的目录 / 文件名（小写）：群晖回收站、索引目录等
-_SKIP_LOWER = {"#recycle", "@eadir", "__macosx"}
+# 跳过的目录 / 文件名（小写）：群晖回收站、索引目录、删除恢复缓存等
+_FILTER_RECOVERY_DIRNAME = "filter-recovery"
+_SKIP_LOWER = {"#recycle", "@eadir", "__macosx", _FILTER_RECOVERY_DIRNAME}
 
 
 def should_skip_name(name: str) -> bool:
@@ -22,7 +23,7 @@ def should_skip_name(name: str) -> bool:
 
     - 空名 / None：跳
     - 以 . 开头：跳（隐藏文件、.DS_Store 等）
-    - 群晖回收站 / 索引、macOS 压缩包元数据目录：跳
+    - 群晖回收站 / 索引、macOS 元数据、删除恢复缓存目录：跳
 
     下划线是合法资源文件名的一部分。ASMR 特典中常见 ``_096.png``
     这类文件，不能再把所有 ``_`` 前缀统一视为内部临时项。
@@ -32,6 +33,15 @@ def should_skip_name(name: str) -> bool:
     if name.startswith("."):
         return True
     return name.lower() in _SKIP_LOWER
+
+
+def is_filter_recovery_path(path: str) -> bool:
+    """路径是否位于删除恢复缓存内；只匹配完整目录组件，兼容两种分隔符。"""
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    return any(
+        component.casefold() == _FILTER_RECOVERY_DIRNAME
+        for component in normalized.split("/")
+    )
 
 
 def extract_rjcode(value: str) -> Optional[str]:

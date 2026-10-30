@@ -106,3 +106,31 @@ async def test_remote_scanner_falls_back_to_list_walk_when_search_returns_empty(
     assert entries[1].rjcode == "RJ01000001"
     assert ("/AMSR", 0) in client.list_calls
     assert ("/AMSR/社团A", 0) in client.list_calls
+
+
+def test_remote_scanner_excludes_filter_recovery_without_matching_similar_names():
+    scanner = RemoteScanner()
+    cached = scanner._raw_to_entry(
+        "remote-library-2",
+        {
+            "name": "RJ01476998",
+            "path": "/AMSR/filter-recovery/task-1/RJ01476998",
+            "isdir": True,
+            "additional": {"time": {"mtime": 100}, "size": 0},
+        },
+        "/AMSR",
+    )
+    normal = scanner._raw_to_entry(
+        "remote-library-2",
+        {
+            "name": "RJ01476998",
+            "path": "/AMSR/filter-recovery-copy/RJ01476998",
+            "isdir": True,
+            "additional": {"time": {"mtime": 100}, "size": 0},
+        },
+        "/AMSR",
+    )
+
+    assert cached is None
+    assert normal is not None
+    assert normal.relative_path == "filter-recovery-copy/RJ01476998"

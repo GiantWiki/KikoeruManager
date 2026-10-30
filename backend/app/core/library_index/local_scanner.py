@@ -20,6 +20,7 @@ import time
 from typing import Callable, Iterator, Optional
 
 from ._helpers import extract_rjcode as _extract_rjcode
+from ._helpers import is_filter_recovery_path as _is_filter_recovery_path
 from ._helpers import should_skip_name as _should_skip
 from .types import IndexEntry
 
@@ -133,6 +134,15 @@ class LocalScanner:
                     f"subtree 不在 library_root 下: subtree={subtree_path} "
                     f"library_root={library_root}"
                 )
+
+        subtree_relative = _to_relative_posix(normalized_subtree, normalized_root)
+        if _is_filter_recovery_path(subtree_relative):
+            logger.info(
+                "[LocalScanner] 跳过删除恢复缓存子树 library=%s subtree=%s",
+                library_id,
+                normalized_subtree,
+            )
+            return
 
         scanned = [0]
         started = time.time()

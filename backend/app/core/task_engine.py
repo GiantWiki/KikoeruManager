@@ -1390,12 +1390,13 @@ class TaskEngine:
         return TaskStatus.COMPLETED
 
     def load_persisted_queue_tasks(self) -> int:
-        """恢复本版本明确标记的通用任务；历史无标记快照绝不自动执行。"""
+        """恢复通用任务记录；只有显式 v1 契约允许重启后自动入队。"""
         from ..models.database import SessionLocal, Task as TaskRecord
 
         db = SessionLocal()
         loaded_count = 0
         queued_count = 0
+        legacy_loaded_count = 0
         try:
             rows = db.query(TaskRecord).order_by(TaskRecord.created_at.asc()).all()
             for row in rows:
@@ -1405,9 +1406,8 @@ class TaskEngine:
                 try:
                     restore_version = int(metadata.get(self._QUEUE_RESTORE_VERSION_KEY) or 0)
                 except (TypeError, ValueError):
-                    continue
-                if restore_version != self._QUEUE_RESTORE_VERSION:
-                    continue
+                    restore_version = 0
+                has_explicit_restore_contract = restore_version == self._QUEUE_RESTORE_VERSION
 
                 task_type = self._coerce_task_type(row.type)
                 if task_type is None:
@@ -1442,8 +1442,27 @@ class TaskEngine:
                     restored_status == TaskStatus.WAITING_RETRY
                     and bool(metadata.get("stale_processing_recovered"))
                 )
-                should_requeue = restored_status in {TaskStatus.PENDING, TaskStatus.PROCESSING} or interrupted_processing_retry
-                if should_requeue:
+                should_requeue = has_explicit_restore_contract and (
+                    restored_status in {TaskStatus.PENDING, TaskStatus.PROCESSING}
+                    or interrupted_processing_retry
+                )
+                legacy_interrupted = not has_explicit_restore_contract and (
+                    restored_status in {TaskStatus.PENDING, TaskStatus.PROCESSING}
+                    or interrupted_processing_retry
+                )
+                if legacy_interrupted:
+                    metadata = dict(task.task_metadata or {})
+                    metadata["pause_origin_status"] = TaskStatus.PENDING.value
+                    metadata["legacy_restore_requires_manual_resume"] = True
+                    metadata["legacy_restore_from_status"] = restored_status.value
+                    task.task_metadata = metadata
+                    with task._set_state_silent():
+                        task.status = TaskStatus.PAUSED
+                        task.current_step = "历史任务已恢复，点击继续后执行"
+                        task.started_at = None
+                        task.completed_at = None
+                        task._pause_event.clear()
+                elif should_requeue:
                     previous_status = restored_status.value
                     metadata = dict(task.task_metadata or {})
                     metadata["restart_recovered_from_status"] = previous_status
@@ -1459,12 +1478,16 @@ class TaskEngine:
                     self.queue.put_nowait(task)
                     queued_count += 1
                     task.mark_changed("restart_recovered")
+                if not has_explicit_restore_contract:
+                    legacy_loaded_count += 1
+                    task.mark_changed("legacy_restored")
                 loaded_count += 1
 
             if loaded_count:
                 logger.info(
-                    "[任务持久化] 已恢复通用任务 %s 个，其中 %s 个重新入队",
+                    "[任务持久化] 已恢复通用任务 %s 个（历史无标记 %s 个），其中 %s 个重新入队",
                     loaded_count,
+                    legacy_loaded_count,
                     queued_count,
                 )
             return loaded_count
@@ -2932,7 +2955,15 @@ class TaskEngine:
         try:
             task.start()
             await self._notify_progress(task)
-            
+
+            if (
+                task.type == TaskType.AUTO_PROCESS
+                and str((task.task_metadata or {}).get("resume_from_stage") or "").strip().lower()
+                == "dlsite_network"
+            ):
+                await self._resume_dlsite_network_task(task, rjcode)
+                return
+
             if task.type == TaskType.AUTO_PROCESS:
                 from ..config.settings import get_config
                 config = get_config()
@@ -4355,6 +4386,110 @@ class TaskEngine:
         except Exception:
             return ""
 
+    async def _resume_dlsite_network_task(self, task: Task, rjcode: str) -> None:
+        """从 DLsite 网络暂停点续跑，只刷新元数据并完成归档收尾。"""
+        from ..config.settings import get_config
+        from .dlsite_service import clear_dlsite_transport_failure
+        from .metadata_service import MetadataService
+
+        output_path = str(task.output_path or "").strip()
+        if not output_path or not os.path.exists(output_path):
+            raise FileNotFoundError(f"DLsite 续跑产物不存在: {output_path or '未记录输出路径'}")
+
+        task.update_progress(90, "重新获取 DLsite 元数据")
+        # 清除上一次暂停留下的全局失败快照，确保本次结果只由本轮请求决定。
+        clear_dlsite_transport_failure()
+        try:
+            metadata = await MetadataService().fetch(
+                output_path,
+                task,
+                force_refresh=True,
+            )
+        except Exception as exc:
+            reason = f"DLsite 元数据强制刷新异常: {exc}"
+            logger.warning("[%s] %s；保留已有产物并继续等待人工", rjcode, reason)
+            self._mark_dlsite_network_paused(task, reason)
+            return
+
+        metadata = dict(metadata or {})
+        task.task_metadata = {
+            **(task.task_metadata or {}),
+            **metadata,
+        }
+        effective_rjcode = self._get_effective_rjcode(task, output_path)
+        if effective_rjcode:
+            if not metadata.get("rjcode"):
+                task.task_metadata["rjcode"] = effective_rjcode
+            rjcode = self._sync_task_rjcode(
+                task,
+                effective_rjcode,
+                source=task.task_metadata.get("rjcode_source") or "dlsite_network_resume",
+            )
+
+        dlsite_network_error = self._dlsite_transport_failure_reason()
+        if dlsite_network_error:
+            logger.warning(
+                "[%s] DLsite 元数据网络仍不可达，保留产物并继续等待人工: %s",
+                rjcode,
+                dlsite_network_error,
+            )
+            self._mark_dlsite_network_paused(task, dlsite_network_error)
+            return
+
+        next_metadata = dict(task.task_metadata or {})
+        for key in (
+            "resume_from_stage",
+            "dlsite_network_paused",
+            "dlsite_network_error",
+            "retry_exhausted",
+            "retry_exhausted_at",
+        ):
+            next_metadata.pop(key, None)
+        task.task_metadata = next_metadata
+        task.error_message = None
+
+        config = get_config()
+        if config.auto_process.archive and not task.skip_archive:
+            task.update_progress(95, "归档压缩包")
+            await self._archive_source_file(task)
+        else:
+            logger.info("[%s] DLsite 续跑时归档已禁用或显式跳过", rjcode)
+
+        nested_subtitle_filenames = list(
+            (task.task_metadata or {}).get("nested_subtitle_archive_filenames") or []
+        )
+        if nested_subtitle_filenames and task.output_path and rjcode:
+            await self._queue_nested_subtitle_archives(
+                task, rjcode, task.output_path, nested_subtitle_filenames
+            )
+
+        if task.output_path and rjcode and rjcode != "未知":
+            try:
+                from .circle_completion_service import get_circle_completion_service
+
+                await get_circle_completion_service().sync_owned_for_rj(
+                    rjcode,
+                    folder_path=task.output_path,
+                    library_id=str((task.task_metadata or {}).get("target_library_id") or ""),
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] DLsite 续跑完成后同步社团拥有态失败 path=%s",
+                    rjcode,
+                    task.output_path,
+                    exc_info=True,
+                )
+
+        task.update_progress(100, "完成")
+        task.complete()
+        try:
+            from .notification_helper import build_import_notification_extra, set_notification_extra
+
+            set_notification_extra(task, **build_import_notification_extra(task))
+        except Exception:
+            logger.warning("[通知] 构建 DLsite 续跑完成 payload 失败", exc_info=True)
+        logger.info("[%s] ========== DLsite 暂停点续跑完成 ==========", rjcode)
+
     def _mark_dlsite_network_paused(self, task: Task, reason: str) -> None:
         """DLsite 元数据因网络/DNS 不可达时暂停任务，等用户确认网络后手动重试。
 
@@ -4366,6 +4501,7 @@ class TaskEngine:
             "retry_exhausted": True,
             "retry_exhausted_at": datetime.now().isoformat(),
             "available_actions": ["RETRY", "SKIP"],
+            "resume_from_stage": "dlsite_network",
             "dlsite_network_paused": True,
             "dlsite_network_error": str(reason or "")[:240],
         }
@@ -4501,6 +4637,47 @@ class TaskEngine:
             self._retry_scheduler_task.cancel()
         # 等待已排队的任务快照写完，避免正常重启丢掉最后一次状态变更。
         self._materialized_snapshot_executor.shutdown(wait=True, cancel_futures=False)
+
+    async def retry_dlsite_network_paused_task(self, task_id: str) -> Task:
+        """复用原任务和已有产物，从 DLsite 网络暂停点重新入队。"""
+        task = self.tasks.get(str(task_id or "").strip())
+        if not task:
+            raise ValueError("DLsite 暂停任务不存在")
+        if task.type != TaskType.AUTO_PROCESS or not bool(
+            (task.task_metadata or {}).get("dlsite_network_paused")
+        ):
+            raise ValueError("当前任务不是 DLsite 网络暂停任务")
+        if task.status != TaskStatus.WAITING_MANUAL or task.id in self.processing:
+            raise ValueError("DLsite 暂停任务正在执行或状态已变化，不能重复重试")
+        output_path = str(task.output_path or "").strip()
+        if not output_path or not os.path.exists(output_path):
+            raise FileNotFoundError(f"DLsite 续跑产物不存在: {output_path or '未记录输出路径'}")
+
+        metadata = dict(task.task_metadata or {})
+        metadata["resume_from_stage"] = "dlsite_network"
+        metadata["dlsite_network_retry_count"] = int(
+            metadata.get("dlsite_network_retry_count") or 0
+        ) + 1
+        metadata["dlsite_network_retry_requested_at"] = datetime.now().isoformat()
+        task.task_metadata = metadata
+        with task._set_state_silent():
+            task.status = TaskStatus.PENDING
+            task.current_step = "等待从 DLsite 元数据阶段继续"
+            task.error_message = None
+            task.started_at = None
+            task.completed_at = None
+            task._cancelled = False
+            task._pause_event.set()
+        self.processing.discard(task.id)
+        self._ensure_task_context(task)
+        await self.queue.put(task)
+        task.mark_changed("dlsite_network_retry")
+        logger.info(
+            "DLsite 网络暂停任务已复用原任务重新入队: task_id=%s output=%s",
+            task.id,
+            output_path,
+        )
+        return task
 
     def retry_task(self, task_id: str):
         """手动重试等待中的任务"""
