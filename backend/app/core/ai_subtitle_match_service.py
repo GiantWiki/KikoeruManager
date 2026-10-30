@@ -152,7 +152,7 @@ def lookup_model_output_limit(api_base: str, model_id: str) -> int:
     return _safe_int(limits.get("max_output_tokens"))
 
 
-def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
+def _extract_litellm_content(response: Any, *, include_reasoning: bool = True) -> Tuple[str, Dict[str, int]]:
     usage_obj = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     if usage_obj is None:
         usage = {}
@@ -175,11 +175,14 @@ def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
     choice = choices[0]
     message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
     if isinstance(message, dict):
-        # 推理模型正文为空时回退到 reasoning_content，避免误判为空响应
-        content = message.get("content") or message.get("reasoning_content") or ""
+        content = message.get("content") or ""
+        if include_reasoning and not content:
+            content = message.get("reasoning_content") or ""
     else:
         if message is not None:
-            content = getattr(message, "content", None) or getattr(message, "reasoning_content", None) or ""
+            content = getattr(message, "content", None) or ""
+            if include_reasoning and not content:
+                content = getattr(message, "reasoning_content", None) or ""
         else:
             content = ""
     return str(content or ""), {
@@ -187,6 +190,17 @@ def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
         "completion_tokens": _safe_int(usage.get("completion_tokens")),
         "total_tokens": _safe_int(usage.get("total_tokens")),
     }
+
+
+def _extract_litellm_finish_reason(response: Any) -> str:
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if not choices:
+        return ""
+    choice = choices[0]
+    return _safe_text(
+        choice.get("finish_reason") if isinstance(choice, dict)
+        else getattr(choice, "finish_reason", "")
+    ).lower()
 
 
 def _litellm_stream_chunk_seen(chunk: Any) -> bool:
@@ -657,6 +671,7 @@ class AISubtitleMatchService:
         *,
         request_label: str,
         stats: Optional[Dict[str, Any]] = None,
+        require_formal_answer: bool = True,
     ) -> Tuple[str, Dict[str, int]]:
         stream_kwargs = dict(kwargs)
         stream_kwargs["stream"] = True
@@ -665,12 +680,21 @@ class AISubtitleMatchService:
         content_parts: List[str] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         saw_chunk = False
+        saw_reasoning = False
+        finish_reason = ""
 
         stream = await litellm.acompletion(**stream_kwargs)
         async for chunk in stream:
             if _litellm_stream_chunk_seen(chunk):
                 saw_chunk = True
-            delta, chunk_usage = _extract_litellm_stream_delta(chunk)
+            primary, collected, chunk_usage, chunk_finish_reason = extract_litellm_stream_delta_verbose(chunk)
+            delta = collected.get("content", "") if require_formal_answer else primary
+            if require_formal_answer and any(
+                collected.get(key) for key in ("reasoning_content", "reasoning", "thinking")
+            ):
+                saw_reasoning = True
+            if chunk_finish_reason:
+                finish_reason = _safe_text(chunk_finish_reason).lower()
             if delta:
                 if first_chunk_ms is None:
                     first_chunk_ms = int((time.perf_counter() - started) * 1000)
@@ -682,16 +706,21 @@ class AISubtitleMatchService:
                 usage = _merge_usage_fields(usage, chunk_usage)
         if stats is not None:
             stats["saw_chunk"] = saw_chunk
+        content = "".join(content_parts)
         duration_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
             "[AI字幕] %s 流式完成: duration_ms=%s first_chunk_ms=%s output_chars=%s tokens=%s",
             request_label,
             duration_ms,
             first_chunk_ms,
-            len("".join(content_parts)),
+            len(content),
             usage.get("total_tokens", 0),
         )
-        return "".join(content_parts), usage
+        if require_formal_answer and finish_reason == "length":
+            raise ValueError("模型输出被截断（finish_reason=length），未返回完整 JSON")
+        if require_formal_answer and not content and saw_reasoning:
+            raise ValueError("模型仅返回思考内容，未返回正式 JSON 答案")
+        return content, usage
 
     async def _complete_non_streaming(
         self,
@@ -699,11 +728,15 @@ class AISubtitleMatchService:
         kwargs: Dict[str, Any],
         *,
         request_label: str,
+        require_formal_answer: bool = True,
     ) -> Tuple[str, Dict[str, int]]:
         started = time.perf_counter()
         response = await litellm.acompletion(**kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
-        content, usage = _extract_litellm_content(response)
+        content, usage = _extract_litellm_content(
+            response,
+            include_reasoning=not require_formal_answer,
+        )
         logger.info(
             "[AI字幕] %s 非流式完成: duration_ms=%s output_chars=%s tokens=%s",
             request_label,
@@ -711,6 +744,12 @@ class AISubtitleMatchService:
             len(content),
             usage.get("total_tokens", 0),
         )
+        if require_formal_answer and _extract_litellm_finish_reason(response) == "length":
+            raise ValueError("模型输出被截断（finish_reason=length），未返回完整 JSON")
+        if require_formal_answer and not content:
+            reasoning_content, _ = _extract_litellm_content(response)
+            if reasoning_content:
+                raise ValueError("模型仅返回思考内容，未返回正式 JSON 答案")
         return content, usage
 
     async def _complete_with_stream_preferred(
@@ -829,6 +868,7 @@ class AISubtitleMatchService:
                             kwargs,
                             request_label=request_label,
                             stats=probe_stats,
+                            require_formal_answer=False,
                         ),
                         timeout=hard_timeout,
                     )
@@ -849,6 +889,7 @@ class AISubtitleMatchService:
                             litellm,
                             kwargs,
                             request_label=request_label,
+                            require_formal_answer=False,
                         ),
                         timeout=hard_timeout,
                     )
@@ -1166,7 +1207,9 @@ class AISubtitleMatchService:
         group_by_id: Dict[str, Dict[str, Any]],
         threshold: int,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
-        matches = response.get("matches") or []
+        if "matches" not in response:
+            raise ValueError("json_output_failed: 缺少 matches 数组")
+        matches = response["matches"]
         if not isinstance(matches, list):
             raise ValueError("json_output_failed: matches 必须是数组")
 

@@ -1105,6 +1105,8 @@ class TaskCenterService:
             actions.extend(["pause", "cancel"])
         elif task.status == TaskStatus.PAUSED:
             actions.extend(["resume", "cancel"])
+        elif domain == "ai_title" and task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            actions.extend(["rollback_ai_title", "delete"])
         elif domain in {"http_download", "baidu_netdisk"} and task.status == TaskStatus.COMPLETED and list((task.task_metadata or {}).get("failed_files") or []):
             actions.extend(["retry", "delete"])
         elif task.status == TaskStatus.FAILED and self._can_retry_engine_task(task, domain, check_source_exists=check_retry_source):
@@ -2484,6 +2486,16 @@ class TaskCenterService:
                     "message": "请前往字幕补配页继续处理",
                     "route_hint": self.DOMAIN_ROUTE_HINT["subtitle_import"],
                 }
+            if normalized_action == "rollback_ai_title":
+                if self._infer_domain(task) != "ai_title":
+                    raise ValueError("仅 AI 标题汉化任务支持回退")
+                if task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                    raise ValueError("任务仍在执行中，不能回退")
+                from .ai_title_translation_service import get_ai_title_translation_service
+
+                result = await get_ai_title_translation_service().rollback_task_changes(task)
+                await asyncio.to_thread(engine.persist_task_snapshot, task)
+                return result
             if normalized_action == "pause":
                 engine.pause_task(engine_task_id)
                 return {"success": True, "message": "任务已暂停"}

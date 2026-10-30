@@ -1404,6 +1404,59 @@ class TaskEngine:
         finally:
             db.close()
 
+    def load_persisted_ai_title_tasks(self) -> int:
+        """恢复已结束的 AI 标题汉化任务，保持任务中心跨重启可查。"""
+        from ..models.database import SessionLocal, Task as TaskRecord
+
+        terminal_statuses = {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        }
+        db = SessionLocal()
+        loaded_count = 0
+        try:
+            rows = (
+                db.query(TaskRecord)
+                .filter(
+                    TaskRecord.type == TaskType.AI_TITLE_TRANSLATION.value,
+                    TaskRecord.status.in_(terminal_statuses),
+                )
+                .all()
+            )
+            for row in rows:
+                if row.id in self.tasks:
+                    continue
+                metadata = dict(row.task_metadata or {})
+                task = Task(
+                    task_type=TaskType.AI_TITLE_TRANSLATION,
+                    source_path=row.source_path or metadata.get("rjcode") or "",
+                    output_path=row.output_path,
+                    auto_classify=bool(metadata.get("auto_classify", False)),
+                    metadata=metadata,
+                    task_id=row.id,
+                    status=self._coerce_task_status(row.status),
+                    rjcode=metadata.get("rjcode") or "",
+                )
+                with task._set_state_silent():
+                    task.progress = int(row.progress or 0)
+                    task.current_step = row.current_step or "AI 标题汉化已结束"
+                    task.error_message = row.error_message
+                    task.created_at = row.created_at or task.created_at
+                    task.started_at = row.started_at
+                    task.completed_at = row.completed_at
+                self._ensure_task_context(task)
+                self.tasks[task.id] = task
+                loaded_count += 1
+            if loaded_count:
+                logger.info("[任务持久化] 已恢复 AI 标题汉化终态任务 %s 个", loaded_count)
+            return loaded_count
+        except Exception:
+            logger.warning("[任务持久化] 恢复 AI 标题汉化任务失败", exc_info=True)
+            return 0
+        finally:
+            db.close()
+
     def recover_stale_processing_tasks(self) -> int:
         """把上次进程中断留下的 processing 快照恢复为等待重试。
 
@@ -4027,9 +4080,14 @@ class TaskEngine:
             except Exception:
                 logger.warning("[任务清理] 发送最终进度失败: task_id=%s", task.id, exc_info=True)
             try:
-                await asyncio.to_thread(self.persist_task_center_item_snapshot, task)
+                snapshot_writer = (
+                    self.persist_task_snapshot
+                    if task.type == TaskType.AI_TITLE_TRANSLATION
+                    else self.persist_task_center_item_snapshot
+                )
+                await asyncio.to_thread(snapshot_writer, task)
             except Exception:
-                logger.warning("[任务中心物化] 写入最终任务快照失败: task_id=%s", task.id, exc_info=True)
+                logger.warning("[任务持久化] 写入最终任务快照失败: task_id=%s", task.id, exc_info=True)
     
     async def _worker(self):
         """工作线程"""
@@ -4074,6 +4132,7 @@ class TaskEngine:
         self.recover_stale_processing_tasks()
         self.load_waiting_retry_tasks()
         self.load_persisted_linked_subtitle_tasks()
+        self.load_persisted_ai_title_tasks()
 
     async def _retry_scheduler(self):
         """定时重试调度器，使用cron表达式"""
@@ -7602,6 +7661,16 @@ class TaskEngine:
         all_folder_results = []
         ai_translation_results = []
 
+        def publish_ai_rollback_snapshot():
+            """每次修改后立即挂载完整回退现场，终态由 _process_task 统一落库。"""
+            task.task_metadata["ai_translation"] = ai_translation_results
+            task.task_metadata["renamed_files"] = all_renamed_files
+            task.task_metadata["folder_renamed"] = all_folder_results
+            task.task_metadata["renamed_count"] = sum(1 for f in all_renamed_files if f.get("status") == "ok")
+            task.task_metadata["failed_count"] = sum(1 for f in all_renamed_files if f.get("status") != "ok")
+            task.task_metadata["folder_renamed_count"] = sum(1 for f in all_folder_results if f.get("success"))
+
+        publish_ai_rollback_snapshot()
         try:
             for r in results:
                 if not (r.get("success") and r.get("translated_title")):
@@ -7652,23 +7721,48 @@ class TaskEngine:
                     if _is_refusal_text(translated):
                         logger.warning("[AI标题] 拒答文案拦截，不写入 ai_title: rj=%s", rj)
                         translated = ""
+                original_ai_title = None
+                ai_title_write_status = "skipped"
+                ai_title_write_error = ""
                 if translated:
+                    fdb = None
                     try:
                         fdb = next(_get_db())
-                        fdb.execute(
+                        previous_row = fdb.execute(
+                            _sql_text("SELECT ai_title FROM work_metadata WHERE rjcode = :rjcode"),
+                            {"rjcode": rj},
+                        ).fetchone()
+                        original_ai_title = previous_row[0] if previous_row else None
+                        update_result = fdb.execute(
                             _sql_text("UPDATE work_metadata SET ai_title = :ai_title WHERE rjcode = :rjcode"),
                             {"ai_title": translated, "rjcode": rj}
                         )
-                        fdb.commit()
-                        fdb.close()
+                        if int(getattr(update_result, "rowcount", 0) or 0) > 0:
+                            fdb.commit()
+                            ai_title_write_status = "success"
+                        else:
+                            ai_title_write_status = "not_found"
                     except Exception as exc:
+                        ai_title_write_status = "failed"
+                        ai_title_write_error = str(exc)
+                        if fdb is not None:
+                            fdb.rollback()
                         logger.warning("[AI标题] 写入 ai_title 失败: %s", exc)
+                    finally:
+                        if fdb is not None:
+                            fdb.close()
 
                 ai_translation_results.append({
                     "rjcode": rj,
                     "original_title": r.get("original_title") or "",
                     "translated_title": translated,
+                    "original_ai_title": original_ai_title,
+                    "written_ai_title": translated,
+                    "write_status": ai_title_write_status,
+                    "write_error": ai_title_write_error,
+                    "rollback_status": "pending" if ai_title_write_status == "success" else "not_applicable",
                 })
+                publish_ai_rollback_snapshot()
 
                 rd = rename_data_by_rjcode.get(rj)
                 if rd and rd.get("base_to_entries"):
@@ -7695,18 +7789,23 @@ class TaskEngine:
                                     new_name = f"{new_base}{entry['ext']}"
                                     try:
                                         rn_mgr = get_library_manager()
-                                        await rn_mgr.rename(
-                                            library_id,
+                                        rename_result = await rn_mgr.rename(
+                                            rd.get("library_id") or library_id,
                                             entry["path"],
                                             new_name,
                                             skip_index_mutation=False,
                                             sync_index_mutation=False,
                                         )
                                         all_renamed_files.append({
+                                            "rjcode": rj,
+                                            "library_id": rd.get("library_id") or library_id,
                                             "old_name": entry["name"],
                                             "new_name": new_name,
+                                            "old_path": entry["path"],
+                                            "new_path": str((rename_result or {}).get("new_path") or ""),
                                             "status": "ok",
                                             "error": "",
+                                            "rollback_status": "pending",
                                         })
                                     except Exception as exc:
                                         all_renamed_files.append({
@@ -7715,6 +7814,7 @@ class TaskEngine:
                                             "status": "failed",
                                             "error": str(exc),
                                         })
+                                    publish_ai_rollback_snapshot()
 
                     folder_path_val = rd.get("path") if isinstance(rd, dict) else None
                     if folder_path_val:
@@ -7762,7 +7862,7 @@ class TaskEngine:
                                     folder_src = str(folder_path_val).rstrip("/\\")
                                     if folder_src:
                                         rn_mgr2 = get_library_manager()
-                                        await rn_mgr2.rename(
+                                        folder_rename_result = await rn_mgr2.rename(
                                             rd.get("library_id") or library_id,
                                             folder_src,
                                             folder_title_clean,
@@ -7771,10 +7871,14 @@ class TaskEngine:
                                         )
                                         all_folder_results.append({
                                             "rjcode": rj,
+                                            "library_id": rd.get("library_id") or library_id,
                                             "success": True,
                                             "old_name": os.path.basename(folder_src),
                                             "new_name": folder_title_clean,
+                                            "old_path": folder_src,
+                                            "new_path": str((folder_rename_result or {}).get("new_path") or ""),
                                             "error": "",
+                                            "rollback_status": "pending",
                                         })
                         except Exception as exc:
                             all_folder_results.append({
@@ -7784,19 +7888,14 @@ class TaskEngine:
                                 "new_name": "",
                                 "error": str(exc),
                             })
+                        publish_ai_rollback_snapshot()
 
                 task.update_progress(90, "AI 标题翻译完成")
         except Exception as exc:
             logger.warning("[AI标题] 翻译后处理失败: %s", exc)
             append_progress_log(f"翻译后处理失败: {exc}", None, "error")
 
-        task.task_metadata["ai_translation"] = ai_translation_results
-        task.task_metadata["renamed_files"] = all_renamed_files
-        task.task_metadata["folder_renamed"] = all_folder_results
-        task.task_metadata["renamed_count"] = sum(1 for f in all_renamed_files if f.get("status") == "ok")
-        task.task_metadata["failed_count"] = sum(1 for f in all_renamed_files if f.get("status") != "ok")
-        task.task_metadata["folder_renamed_count"] = sum(1 for f in all_folder_results if f.get("success"))
-
+        publish_ai_rollback_snapshot()
         append_progress_log(f"翻译完成: 重命名文件 {task.task_metadata['renamed_count']} 个，文件夹 {task.task_metadata['folder_renamed_count']} 个", 100)
         task.update_progress(100, "AI 标题翻译完成")
 

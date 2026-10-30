@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -126,7 +127,11 @@ def _config_to_dict(config: Any) -> Dict[str, Any]:
 
 
 
-def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
+def _extract_litellm_content(
+    response: Any,
+    *,
+    include_reasoning: bool = True,
+) -> Tuple[str, Dict[str, int]]:
     usage_obj = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     if usage_obj is None:
         usage = {}
@@ -145,14 +150,12 @@ def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
     if isinstance(choice, dict):
         message = choice.get("message", {})
         content = message.get("content", "")
-        if not content:
-            # 推理模型正文为空时回退到 reasoning_content，避免误判为空响应
-            # （与 AI 字幕配对的同名函数口径一致）。
+        if include_reasoning and not content:
             content = message.get("reasoning_content", "") or message.get("reasoning", "")
     else:
         message = getattr(choice, "message", None)
         content = getattr(message, "content", "") if message is not None else ""
-        if not content and message is not None:
+        if include_reasoning and not content and message is not None:
             content = getattr(message, "reasoning_content", "") or getattr(message, "reasoning", "")
     if isinstance(content, list):
         content = "".join(
@@ -374,10 +377,11 @@ def _extract_answer_from_reasoning(text: str) -> str:
         if not stripped:
             continue
         for marker in _ANSWER_LINE_MARKERS:
-            position = stripped.find(marker)
-            if position < 0:
+            # 只接受答案行行首的标记。模型复述提示词时，行内也会出现
+            # “value 为翻译结果：……”，用 find() 会把后面的提示词片段当标题。
+            if not stripped.startswith(marker):
                 continue
-            candidate = stripped[position + len(marker):].strip()
+            candidate = stripped[len(marker):].strip()
             candidate = candidate.strip('"').strip("'").strip("「").strip("」").strip()
             if candidate and len(candidate) <= _MAX_TITLE_CHARS:
                 return candidate
@@ -411,8 +415,8 @@ def _extract_translation_text(
     3. 无 ``{`` → 纯文本清洗。
 
     回退（思考文本）路径：
-    a. 先扫描 JSON 对象，命中即用；
-    b. 否则按 ``翻译：`` 之类别名抠出答案行；
+    a. 先按 ``翻译：`` 之类别名抠出答案行，避免把前面的草稿 JSON 当答案；
+    b. 没有答案标记时才扫描 JSON 对象；
     c. **仍取不到、或取到的东西像思考过程（多行 / 超长）→ 明确失败**，
        绝不把整段思考当标题返回。
     """
@@ -421,7 +425,10 @@ def _extract_translation_text(
         return text
 
     if reasoning_fallback:
-        # a. 思考里可能夹带真正的 JSON 答案。
+        # 显式答案标记优先于草稿 JSON。
+        answer = _extract_answer_from_reasoning(text)
+        if answer:
+            return _reject_if_reasoning_like(answer, request_label=request_label)
         parsed = _scan_first_json_object(text)
         if isinstance(parsed, dict):
             values = [v.strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
@@ -429,10 +436,6 @@ def _extract_translation_text(
                 return _reject_if_reasoning_like(values[0], request_label=request_label)
             if len(values) > 1:
                 return json.dumps(parsed, ensure_ascii=False)
-        # b. 按「翻译：」等标记抠答案行。
-        answer = _extract_answer_from_reasoning(text)
-        if answer:
-            return _reject_if_reasoning_like(answer, request_label=request_label)
         # c. 无标记：**短的单行文本**可直接当答案（v2.6.45 兼容——推理模型常把
         #    最终答案直接写在推理字段里，如「圣职者姐妹」），只需过一遍长度/形态闸门。
         if not _looks_like_reasoning_text(text):
@@ -709,6 +712,214 @@ async def _temporary_proxy(proxy_url: str):
 class AITitleTranslationService:
     """AI 标题翻译服务。将日文作品标题翻译为中文。"""
 
+    def __init__(self):
+        # 防止任务中心重复点击导致同一份快照被并发回退。
+        self._rollback_locks: Dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _validate_rollback_snapshot(metadata: Dict[str, Any]) -> None:
+        snapshot_keys = ("ai_translation", "renamed_files", "folder_renamed")
+        if not all(isinstance(metadata.get(key), list) for key in snapshot_keys):
+            raise ValueError("缺少完整回退快照，无法安全回退")
+
+        for entry in metadata.get("ai_translation") or []:
+            if not isinstance(entry, dict):
+                raise ValueError("缺少完整回退快照，无法安全回退")
+            legacy_title_write = "write_status" not in entry and bool(_safe_text(entry.get("translated_title")))
+            if entry.get("write_status") == "success" or legacy_title_write:
+                if (
+                    not _safe_text(entry.get("rjcode"))
+                    or "original_ai_title" not in entry
+                    or not _safe_text(entry.get("written_ai_title"))
+                ):
+                    raise ValueError("缺少完整回退快照，无法安全回退")
+
+        for entry in metadata.get("renamed_files") or []:
+            if not isinstance(entry, dict):
+                raise ValueError("缺少完整回退快照，无法安全回退")
+            if entry.get("status") == "ok" and not all(
+                _safe_text(entry.get(key)) for key in ("library_id", "old_name", "old_path", "new_path")
+            ):
+                raise ValueError("缺少完整回退快照，无法安全回退")
+
+        for entry in metadata.get("folder_renamed") or []:
+            if not isinstance(entry, dict):
+                raise ValueError("缺少完整回退快照，无法安全回退")
+            if entry.get("success") and not all(
+                _safe_text(entry.get(key)) for key in ("library_id", "old_name", "old_path", "new_path")
+            ):
+                raise ValueError("缺少完整回退快照，无法安全回退")
+
+    @staticmethod
+    async def _restore_rename_snapshot(entry: Dict[str, Any], library_manager: Any) -> str:
+        if entry.get("rollback_status") == "restored":
+            return "already"
+
+        current_path = _safe_text(entry.get("new_path"))
+        original_path = _safe_text(entry.get("old_path"))
+        original_name = _safe_text(entry.get("old_name"))
+        library_id = _safe_text(entry.get("library_id"))
+        current_key = os.path.normcase(os.path.abspath(current_path))
+        original_key = os.path.normcase(os.path.abspath(original_path))
+        if current_key == original_key:
+            entry["rollback_status"] = "restored"
+            entry["rollback_error"] = ""
+            return "already"
+
+        current_exists = os.path.exists(current_path)
+        original_exists = os.path.exists(original_path)
+        if not current_exists and original_exists:
+            # 兼容上次重命名已成功、但任务快照尚未来得及落盘的崩溃窗口。
+            entry["rollback_status"] = "restored"
+            entry["rollback_error"] = ""
+            return "already"
+        if not current_exists:
+            entry["rollback_status"] = "skipped"
+            entry["rollback_error"] = "任务写入后的路径已不存在，可能已被后续移动或删除"
+            return "skipped"
+        if original_exists:
+            entry["rollback_status"] = "skipped"
+            entry["rollback_error"] = "原始路径已存在，为避免覆盖后续内容而跳过"
+            return "skipped"
+
+        try:
+            rename_result = await library_manager.rename(
+                library_id,
+                current_path,
+                original_name,
+                skip_index_mutation=False,
+                sync_index_mutation=False,
+            )
+            entry["rollback_status"] = "restored"
+            entry["rollback_error"] = ""
+            entry["rollback_path"] = _safe_text((rename_result or {}).get("new_path")) or original_path
+            return "restored"
+        except Exception as exc:
+            entry["rollback_status"] = "failed"
+            entry["rollback_error"] = str(exc)
+            return "failed"
+
+    @staticmethod
+    def _rollback_title_entry(entry: Dict[str, Any], db: Any, sql_text: Any) -> str:
+        if entry.get("rollback_status") == "restored":
+            return "already"
+        try:
+            row = db.execute(
+                sql_text("SELECT ai_title FROM work_metadata WHERE rjcode = :rjcode"),
+                {"rjcode": entry["rjcode"]},
+            ).fetchone()
+            if not row:
+                entry["rollback_status"] = "skipped"
+                entry["rollback_error"] = "作品元数据已不存在"
+                return "skipped"
+            if row[0] != entry.get("written_ai_title"):
+                entry["rollback_status"] = "skipped"
+                entry["rollback_error"] = "当前 AI 标题已被后续修改，为避免覆盖而跳过"
+                return "skipped"
+            db.execute(
+                sql_text("UPDATE work_metadata SET ai_title = :ai_title WHERE rjcode = :rjcode"),
+                {"ai_title": entry.get("original_ai_title"), "rjcode": entry["rjcode"]},
+            )
+            db.commit()
+            entry["rollback_status"] = "restored"
+            entry["rollback_error"] = ""
+            return "restored"
+        except Exception as exc:
+            db.rollback()
+            entry["rollback_status"] = "failed"
+            entry["rollback_error"] = str(exc)
+            return "failed"
+
+    async def rollback_task_changes(
+        self,
+        task: Any,
+        *,
+        library_manager: Any = None,
+        session_factory: Any = None,
+    ) -> Dict[str, Any]:
+        """按任务快照安全回退 AI 标题、内部文件和项目目录的修改。"""
+        lock_key = _safe_text(getattr(task, "id", "")) or str(id(task))
+        lock = self._rollback_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            return await self._rollback_task_changes_locked(
+                task,
+                library_manager=library_manager,
+                session_factory=session_factory,
+            )
+
+    async def _rollback_task_changes_locked(
+        self,
+        task: Any,
+        *,
+        library_manager: Any = None,
+        session_factory: Any = None,
+    ) -> Dict[str, Any]:
+        metadata = getattr(task, "task_metadata", None)
+        if not isinstance(metadata, dict):
+            raise ValueError("缺少完整回退快照，无法安全回退")
+        self._validate_rollback_snapshot(metadata)
+
+        if library_manager is None:
+            from .library_manager import get_library_manager
+
+            library_manager = get_library_manager()
+
+        outcomes: List[str] = []
+        # 文件快照产生于目录重命名之前；必须先还目录，文件的新路径才重新成立。
+        for entry in metadata.get("folder_renamed") or []:
+            if entry.get("success"):
+                outcomes.append(await self._restore_rename_snapshot(entry, library_manager))
+        for entry in metadata.get("renamed_files") or []:
+            if entry.get("status") == "ok":
+                outcomes.append(await self._restore_rename_snapshot(entry, library_manager))
+
+        title_entries = [
+            entry for entry in (metadata.get("ai_translation") or [])
+            if entry.get("write_status") == "success"
+        ]
+        if title_entries:
+            if session_factory is None:
+                from ..models.database import SessionLocal
+
+                session_factory = SessionLocal
+            from sqlalchemy import text as sql_text
+
+            db = session_factory()
+            try:
+                for entry in title_entries:
+                    outcomes.append(self._rollback_title_entry(entry, db, sql_text))
+            finally:
+                db.close()
+
+        restored_count = outcomes.count("restored")
+        skipped_count = outcomes.count("skipped")
+        failed_count = outcomes.count("failed")
+        already_restored = not outcomes or all(outcome == "already" for outcome in outcomes)
+        if failed_count or skipped_count:
+            message = (
+                f"回退完成：恢复 {restored_count} 项，跳过 {skipped_count} 项，"
+                f"失败 {failed_count} 项；未覆盖冲突或后续修改"
+            )
+        elif already_restored:
+            message = "没有需要回退的修改"
+        else:
+            message = f"已安全回退 {restored_count} 项 AI 汉化修改"
+
+        result = {
+            "success": failed_count == 0,
+            "message": message,
+            "restored_count": restored_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "already_restored": already_restored,
+            "partial": bool(skipped_count or failed_count),
+            "completed_at": datetime.now().isoformat(),
+        }
+        metadata["ai_title_rollback"] = dict(result)
+        touch_metadata = getattr(task, "touch_metadata", None)
+        if callable(touch_metadata):
+            touch_metadata("ai_title_rollback")
+        return result
 
     def _normalize_runtime_config(self, raw_config: Any, *, saved_api_key: str = "") -> Dict[str, Any]:
         config = _config_to_dict(raw_config)
@@ -844,7 +1055,7 @@ class AITitleTranslationService:
                             )
                         else:
                             # 服务端/代理忽略了 stream=True，直接返回完整响应：按非流式解析。
-                            content, usage = _extract_litellm_content(stream)
+                            content, usage = _extract_litellm_content(stream, include_reasoning=False)
                             finish_reason = _extract_finish_reason(stream)
                             collected_fields = _collect_non_stream_text_fields(stream)
                             _log_non_stream_response_fields(request_label, stream, collected_fields)
@@ -862,7 +1073,7 @@ class AITitleTranslationService:
                             litellm.acompletion(**{**kwargs, "num_retries": 0}),
                             timeout=hard_timeout,
                         )
-                        content, usage = _extract_litellm_content(response)
+                        content, usage = _extract_litellm_content(response, include_reasoning=False)
                         finish_reason = _extract_finish_reason(response)
                         collected_fields = _collect_non_stream_text_fields(response)
                         _log_non_stream_response_fields(request_label, response, collected_fields)

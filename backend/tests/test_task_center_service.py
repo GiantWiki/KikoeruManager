@@ -1,14 +1,24 @@
+import asyncio
+import json
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_as_sqlite_json(_type, _compiler, **_kwargs):
+    return "JSON"
+
 from app.core.task_center_service import TaskCenterService
 from app.core.task_engine import Task, TaskEngine, TaskStatus, TaskType
-from app.models.database import Base, TaskCenterItem
+from app.models.database import Base, Task as TaskRecord, TaskCenterItem
 
 
 @pytest.mark.asyncio
@@ -21,8 +31,8 @@ async def test_task_center_cache_uses_engine_version_without_rescanning_tasks(mo
     monkeypatch.setattr(service, "_engine_tasks_snapshot", snapshot)
     monkeypatch.setattr(service, "_engine_change_version", lambda: 7)
     monkeypatch.setattr(service, "_get_pending_items_cached", AsyncMock(return_value=[]))
-    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", Mock(return_value=[]))
-    monkeypatch.setattr(service, "_get_active_conflicts_cached", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_get_active_conflicts_cached", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         service,
         "_safe_serialize_engine_task",
@@ -51,13 +61,17 @@ async def test_task_center_cache_uses_engine_version_without_rescanning_tasks(mo
     assert snapshot.call_count == 1
 
 
-def test_task_engine_task_center_version_increments_on_task_event():
+def test_task_engine_task_center_version_increments_on_task_event(monkeypatch):
     engine = TaskEngine()
     task = Task(TaskType.EXTRACT, "/tmp/work.zip", task_id="task-version")
+    engine.tasks[task.id] = task
     engine._ensure_task_context(task)
+    monkeypatch.setattr(engine, "enqueue_task_center_item_snapshot", Mock())
+    monkeypatch.setattr(engine, "_write_task_runtime_to_redis", Mock())
+    monkeypatch.setattr("app.core.task_center_event_service.broadcast_task_center_changed", Mock())
 
     before = engine.get_task_center_version()
-    task.status = TaskStatus.PROCESSING
+    task.start()
 
     assert engine.get_task_center_version() == before + 1
 
@@ -407,8 +421,8 @@ def test_task_snapshot_materializes_task_center_item(monkeypatch):
     task.created_at = datetime(2026, 1, 1, 8, 0, 0)
     task.update_progress(42, "下载中")
 
-    expected = TaskCenterService()._safe_serialize_engine_task(task, mode="summary")
     task_engine.persist_task_snapshot(task)
+    expected = TaskCenterService()._safe_serialize_engine_task(task, mode="summary")
 
     db = TestingSessionLocal()
     try:
@@ -487,8 +501,8 @@ async def test_task_center_backfill_materialized_items_supports_sql_listing(monk
     monkeypatch.setattr(service, "_engine_tasks_snapshot", Mock(return_value=[task]))
     monkeypatch.setattr(service, "_engine_change_version", lambda: 11)
     monkeypatch.setattr(service, "_get_pending_items_cached", AsyncMock(return_value=[]))
-    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", Mock(return_value=[]))
-    monkeypatch.setattr(service, "_get_active_conflicts_cached", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_get_active_conflicts_cached", AsyncMock(return_value=[]))
 
     result = await service.backfill_materialized_items()
     assert result["matched"] is True
@@ -506,8 +520,10 @@ async def test_task_center_backfill_materialized_items_supports_sql_listing(monk
 
     assert listed["total"] == 1
     assert listed["items"][0]["id"] == f"engine:{task.id}"
-    assert listed["counts_by_domain"] == {"http_download": 1}
-    assert listed["counts_by_status"] == {TaskStatus.PROCESSING.value: 1}
+    assert listed["counts_by_domain"]["http_download"] == 1
+    assert sum(listed["counts_by_domain"].values()) == 1
+    assert listed["counts_by_status"][TaskStatus.PROCESSING.value] == 1
+    assert sum(listed["counts_by_status"].values()) == 1
     assert listed["highlight_counts"]["processing"] == 1
 
 
@@ -551,8 +567,8 @@ async def test_task_center_materialized_summary_can_read_all_item_kinds(monkeypa
     monkeypatch.setattr(service, "_engine_tasks_snapshot", Mock(return_value=[task]))
     monkeypatch.setattr(service, "_engine_change_version", lambda: 12)
     monkeypatch.setattr(service, "_get_pending_items_cached", AsyncMock(return_value=[pending_item]))
-    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", Mock(return_value=[]))
-    monkeypatch.setattr(service, "_get_active_conflicts_cached", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_get_active_conflicts_cached", AsyncMock(return_value=[]))
 
     backfill = await service.backfill_materialized_items()
     assert backfill["matched"] is True
@@ -569,3 +585,355 @@ async def test_task_center_materialized_summary_can_read_all_item_kinds(monkeypa
     assert {item["id"] for item in result["items"]} == {"engine:task-all-kinds", "subtitle-pending:pending-1"}
     assert result["counts_by_domain"]["system"] == 1
     assert result["counts_by_domain"]["subtitle_import"] == 1
+
+
+def _use_empty_non_engine_task_sources(monkeypatch, service):
+    monkeypatch.setattr(service, "_get_pending_items_cached", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_get_waiting_retry_items_cached", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_get_active_conflicts_cached", AsyncMock(return_value=[]))
+
+
+@pytest.mark.asyncio
+async def test_ai_title_terminal_task_survives_repeated_summary_queries(monkeypatch):
+    engine = TaskEngine()
+    task = Task(
+        TaskType.AI_TITLE_TRANSLATION,
+        "RJ01736954",
+        task_id="task-ai-title-same-engine",
+        metadata={"task_domain": "ai_title", "rjcode": "RJ01736954"},
+        status=TaskStatus.COMPLETED,
+    )
+    task.completed_at = datetime(2026, 1, 1, 9, 0, 0)
+    engine.tasks[task.id] = task
+    service = TaskCenterService()
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: engine)
+    _use_empty_non_engine_task_sources(monkeypatch, service)
+
+    first = await service.list_items(mode="summary", domain="ai_title", limit=10)
+    second = await service.list_items(mode="summary", domain="ai_title", limit=10)
+
+    assert first["total"] == 1
+    assert second["total"] == 1
+    assert second["items"][0]["engine_task_id"] == task.id
+
+
+def _use_isolated_task_database(monkeypatch):
+    engine_db = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine_db)
+    Base.metadata.create_all(bind=engine_db)
+
+    import app.models.database as database_module
+    import app.core.task_center_materialization_service as materialization_module
+
+    monkeypatch.setattr(database_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(materialization_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(materialization_module, "_task_center_materialization_service", None)
+    return TestingSessionLocal
+
+
+def _stub_task_engine_side_effects(monkeypatch, engine):
+    monkeypatch.setattr(engine, "_notify_progress", AsyncMock())
+    monkeypatch.setattr(engine, "enqueue_task_center_item_snapshot", Mock())
+    monkeypatch.setattr(engine, "_write_task_runtime_to_redis", Mock())
+    monkeypatch.setattr("app.core.task_center_event_service.broadcast_task_center_changed", Mock())
+    monkeypatch.setattr(engine, "persist_task_center_item_snapshot", Mock())
+    monkeypatch.setattr(engine, "_resolve_retry_extract_conflict", Mock())
+    monkeypatch.setattr(engine, "_resolve_completed_failure_followups", Mock())
+    monkeypatch.setattr(engine, "_finalize_conflict_resolution_task", Mock())
+    monkeypatch.setattr(engine, "_cleanup_task_temp_extract_path", AsyncMock())
+    monkeypatch.setattr(engine, "_cleanup_failed_task", AsyncMock())
+    monkeypatch.setattr(engine, "_refresh_conflict_resolution_progress", Mock())
+    monkeypatch.setattr(engine, "unmark_rjcode_processing", Mock())
+    monkeypatch.setattr("app.core.activity_log_service.log_task_lifecycle_event", Mock())
+    monkeypatch.setattr("app.core.task_notification_service.enqueue_notification_check", AsyncMock())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [
+        ("completed", TaskStatus.COMPLETED),
+        ("failed", TaskStatus.FAILED),
+        ("cancelled", TaskStatus.CANCELLED),
+    ],
+)
+async def test_ai_title_production_terminal_persists_and_restores_after_restart(
+    monkeypatch,
+    outcome,
+    expected_status,
+):
+    """终态记录必须由 _process_task 真实产生，测试不得手工预写 TaskRecord。"""
+    TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    _stub_task_engine_side_effects(monkeypatch, engine)
+    task = Task(
+        TaskType.AI_TITLE_TRANSLATION,
+        "RJ01736954",
+        task_id=f"task-ai-title-restart-{outcome}",
+        metadata={
+            "task_domain": "ai_title",
+            "source_action": "ai_title_translation",
+            "rjcode": "RJ01736954",
+        },
+    )
+    engine.tasks[task.id] = task
+
+    async def run_ai_title(current_task):
+        current_task.task_metadata["ai_translation"] = [{
+            "rjcode": "RJ01736954",
+            "original_ai_title": None,
+            "written_ai_title": "汉化标题",
+            "write_status": "success",
+            "rollback_status": "pending",
+        }]
+        current_task.task_metadata["renamed_files"] = []
+        current_task.task_metadata["folder_renamed"] = []
+        if outcome == "failed":
+            raise RuntimeError("AI 汉化测试失败")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(engine, "_process_ai_title_translation", run_ai_title)
+    await engine._process_task(task)
+    assert task.status == expected_status
+
+    db = TestingSessionLocal()
+    try:
+        row = db.query(TaskRecord).filter(TaskRecord.id == task.id).one_or_none()
+        assert row is not None
+        assert row.status == expected_status.value
+        assert row.task_metadata["ai_translation"][0]["written_ai_title"] == "汉化标题"
+    finally:
+        db.close()
+
+    restarted_engine = TaskEngine()
+    assert restarted_engine.load_persisted_ai_title_tasks() == 1
+    restored = restarted_engine.get_task(task.id)
+    assert restored.status == expected_status
+    assert restored.task_metadata["source_action"] == "ai_title_translation"
+
+    service = TaskCenterService()
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: restarted_engine)
+    _use_empty_non_engine_task_sources(monkeypatch, service)
+    listed = await service.list_items(mode="summary", domain="ai_title", limit=10)
+    detail = await service.get_item(item_id=f"engine:{task.id}")
+
+    assert listed["total"] == 1
+    assert listed["items"][0]["status"] == expected_status.value
+    assert detail["engine_task_id"] == task.id
+
+
+@pytest.mark.asyncio
+async def test_ai_title_cancel_after_partial_changes_restores_complete_rollback_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    """首个作品已改标题/文件/目录后，第二个作品取消仍须可跨重启回退。"""
+    import os
+
+    import app.models.database as database_module
+
+    TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    _stub_task_engine_side_effects(monkeypatch, engine)
+    first_dir = tmp_path / "RJ01000001 作品一"
+    second_dir = tmp_path / "RJ01000002 作品二"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    task = Task(
+        TaskType.AI_TITLE_TRANSLATION,
+        "RJ01000001",
+        task_id="task-ai-title-partial-cancel",
+        metadata={
+            "task_domain": "ai_title",
+            "source_action": "ai_title_translation",
+            "rjcode": "RJ01000001",
+            "rjcodes": ["RJ01000001", "RJ01000002"],
+            "library_id": "lib-a",
+            "path": str(first_dir),
+            "work_names": {
+                "RJ01000001 作品一": "作品一",
+                "RJ01000002 作品二": "作品二",
+            },
+        },
+    )
+    engine.tasks[task.id] = task
+
+    work_names = {"RJ01000001": "作品一", "RJ01000002": "作品二"}
+    ai_titles = {"RJ01000001": None, "RJ01000002": None}
+
+    class FakeWorkSession:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            params = params or {}
+            rjcode = params.get("rjcode")
+            if "SELECT work_name FROM work_metadata" in sql:
+                return SimpleNamespace(fetchone=lambda: (work_names[rjcode],))
+            if "SELECT ai_title, work_name, maker_id" in sql:
+                return SimpleNamespace(fetchone=lambda: (
+                    ai_titles[rjcode], work_names[rjcode], "", "", "", "", "", [], [],
+                ))
+            if "SELECT ai_title FROM work_metadata" in sql:
+                return SimpleNamespace(fetchone=lambda: (ai_titles[rjcode],))
+            if "UPDATE work_metadata SET ai_title" in sql:
+                ai_titles[rjcode] = params["ai_title"]
+                return SimpleNamespace(rowcount=1)
+            raise AssertionError(sql)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_get_db():
+        yield FakeWorkSession()
+
+    monkeypatch.setattr(database_module, "get_db", fake_get_db)
+    monkeypatch.setattr(
+        "app.config.settings.get_config",
+        lambda: SimpleNamespace(ai_title_translation=SimpleNamespace(
+            enabled=True,
+            use_ai_subtitle_api=False,
+        )),
+    )
+    monkeypatch.setattr(
+        "app.api.routes._read_ai_title_translation_api_key_from_disk",
+        lambda: "",
+    )
+
+    async def translate_batch(items, *_args, **_kwargs):
+        results = []
+        for item in items:
+            original_title = str(item["work_name"]).split("\n", 1)[0]
+            results.append({
+                "success": True,
+                "rjcode": item["rjcode"],
+                "original_title": original_title,
+                "translated_title": json.dumps({
+                    original_title: f"{original_title}-汉化",
+                    "01": f"{item['rjcode']}-音轨汉化",
+                }, ensure_ascii=False),
+            })
+        return results
+
+    monkeypatch.setattr(
+        "app.core.ai_title_translation_service.get_ai_title_translation_service",
+        lambda: SimpleNamespace(translate_batch=translate_batch),
+    )
+
+    class FakeRenameManager:
+        def __init__(self):
+            self.rename_calls = []
+
+        def find_rj_in_ready_index(self, rjcode, **_kwargs):
+            return {rjcode: [{"path": str(second_dir), "library_id": "lib-a"}]}
+
+        async def folder_contents(self, path, **_kwargs):
+            return {"items": [{
+                "name": "01.wav",
+                "path": os.path.join(path, "01.wav"),
+                "is_directory": False,
+            }]}
+
+        async def rename(self, _library_id, path, new_name, **_kwargs):
+            self.rename_calls.append((path, new_name))
+            if len(self.rename_calls) == 3:
+                raise asyncio.CancelledError()
+            return {"new_path": os.path.join(os.path.dirname(path), new_name)}
+
+    manager = FakeRenameManager()
+    monkeypatch.setattr("app.core.library_manager.get_library_manager", lambda: manager)
+
+    await engine._process_task(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert len(manager.rename_calls) == 3
+    db = TestingSessionLocal()
+    try:
+        row = db.query(TaskRecord).filter(TaskRecord.id == task.id).one_or_none()
+        assert row is not None
+        assert row.status == TaskStatus.CANCELLED.value
+    finally:
+        db.close()
+
+    restarted_engine = TaskEngine()
+    assert restarted_engine.load_persisted_ai_title_tasks() == 1
+    restored = restarted_engine.get_task(task.id)
+    assert restored.status == TaskStatus.CANCELLED
+    assert len(restored.task_metadata["ai_translation"]) == 2
+    assert len(restored.task_metadata["renamed_files"]) == 1
+    assert len(restored.task_metadata["folder_renamed"]) == 1
+    assert restored.task_metadata["renamed_count"] == 1
+    assert restored.task_metadata["folder_renamed_count"] == 1
+    assert restored.task_metadata["renamed_files"][0]["rollback_status"] == "pending"
+    assert restored.task_metadata["folder_renamed"][0]["rollback_status"] == "pending"
+
+    monkeypatch.setattr(restarted_engine, "persist_task_center_item_snapshot", Mock())
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: restarted_engine)
+    rollback = AsyncMock(return_value={"success": True, "restored_count": 4})
+    monkeypatch.setattr(
+        "app.core.ai_title_translation_service.get_ai_title_translation_service",
+        lambda: SimpleNamespace(rollback_task_changes=rollback),
+    )
+    result = await TaskCenterService().execute_action(f"engine:{task.id}", "rollback_ai_title")
+
+    assert result["success"] is True
+    rollback.assert_awaited_once_with(restored)
+    db = TestingSessionLocal()
+    try:
+        assert db.query(TaskRecord).filter(TaskRecord.id == task.id).one().status == TaskStatus.CANCELLED.value
+    finally:
+        db.close()
+
+
+def test_ai_title_terminal_actions_include_rollback():
+    service = TaskCenterService()
+    task = Task(
+        TaskType.AI_TITLE_TRANSLATION,
+        "RJ01736954",
+        metadata={"task_domain": "ai_title"},
+        status=TaskStatus.FAILED,
+    )
+
+    assert service._build_engine_actions(task, "ai_title") == ["rollback_ai_title", "delete"]
+
+    task.status = TaskStatus.PROCESSING
+    assert "rollback_ai_title" not in service._build_engine_actions(task, "ai_title")
+
+
+@pytest.mark.asyncio
+async def test_ai_title_rollback_action_persists_updated_snapshot(monkeypatch):
+    task = Task(
+        TaskType.AI_TITLE_TRANSLATION,
+        "RJ01736954",
+        task_id="task-ai-rollback-action",
+        metadata={"task_domain": "ai_title"},
+        status=TaskStatus.FAILED,
+    )
+    engine = Mock()
+    engine.get_task.return_value = task
+    engine.persist_task_snapshot = Mock()
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: engine)
+    rollback = AsyncMock(return_value={
+        "success": True,
+        "message": "已安全回退 2 项 AI 汉化修改",
+        "restored_count": 2,
+    })
+    monkeypatch.setattr(
+        "app.core.ai_title_translation_service.get_ai_title_translation_service",
+        lambda: Mock(rollback_task_changes=rollback),
+    )
+
+    result = await TaskCenterService().execute_action(f"engine:{task.id}", "rollback_ai_title")
+
+    assert result["success"] is True
+    assert result["restored_count"] == 2
+    rollback.assert_awaited_once_with(task)
+    engine.persist_task_snapshot.assert_called_once_with(task)

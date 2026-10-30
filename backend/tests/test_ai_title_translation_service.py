@@ -598,6 +598,50 @@ def test_extract_translation_text_reasoning_with_marker_returns_answer():
     assert out == "对不起，经纪人君 ～帅哥系特摄女演员的肉体改造高潮地狱堕落报告～"
 
 
+def test_extract_answer_from_reasoning_ignores_inline_prompt_echo():
+    """RJ01736954：提示词复述里的行内“翻译结果：”不是答案行。"""
+    from app.core.ai_title_translation_service import _extract_answer_from_reasoning
+
+    reasoning = (
+        "用户要求输出 JSON，key 为原文，value 为翻译结果：” 下面包括主标题和文件树名称……\n"
+        "我需要先分析标题和文件名。\n"
+        "翻译：\n"
+        "真正应当使用的作品标题"
+    )
+    assert _extract_answer_from_reasoning(reasoning) == "真正应当使用的作品标题"
+
+
+def test_extract_translation_text_prompt_echo_without_answer_fails():
+    """只有提示词复述时不得把标记后的短指令当成标题。"""
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    reasoning = (
+        "我们需要回答用户。用户要求输出 JSON，key 为原文，value 为翻译结果：” 下面包括主标题和文件树名称……\n"
+        "接下来分析主标题、社团和各个音轨名称，最后再决定译名。"
+    )
+    with pytest.raises(ValueError, match="思考"):
+        _extract_translation_text(reasoning, reasoning_fallback=True)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_prompt_echo_does_not_pollute_title(monkeypatch):
+    """端到端锁定 RJ01736954：错误短文本不得写成成功标题。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({
+            "content": "",
+            "reasoning_content": (
+                "用户要求输出 JSON，key 为原文，value 为翻译结果：” 下面包括主标题和文件树名称……\n"
+                "接下来分析主标题、社团和各个音轨名称，最后再决定译名。"
+            ),
+        }),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config(max_retries=0))
+    assert result["success"] is False, result
+    assert result["translated_title"] is None
+
+
 def test_extract_translation_text_long_reasoning_without_answer_fails():
     """核心回归：长思考且无标记答案 → 必须失败，绝不返回整段思考。"""
     from app.core.ai_title_translation_service import _extract_translation_text
@@ -720,3 +764,324 @@ def test_normalize_model_entries_carries_limits():
     assert len(rows) == 1
     assert rows[0]["max_output_tokens"] == 8192
     assert rows[0]["context_window"] == 128000
+
+
+# ---------------------------------------------------------------------------
+# 任务级一键回退：只恢复本任务实际写入的标题和成功重命名项。
+# ---------------------------------------------------------------------------
+
+class _RollbackRenameManager:
+    def __init__(self):
+        self.calls = []
+
+    async def rename(self, library_id, path, new_name, **_kwargs):
+        import os
+
+        source = os.path.abspath(str(path))
+        target = os.path.join(os.path.dirname(source), new_name)
+        self.calls.append((library_id, source, new_name))
+        os.rename(source, target)
+        return {"message": "重命名成功", "new_path": target}
+
+
+def _rollback_task(metadata):
+    return types.SimpleNamespace(
+        id="task-ai-rollback",
+        task_metadata=metadata,
+        touch_metadata=lambda *_args, **_kwargs: None,
+    )
+
+
+def _rollback_session_factory(state):
+    class _Session:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            params = params or {}
+            if "SELECT ai_title" in sql:
+                return types.SimpleNamespace(fetchone=lambda: (state["ai_title"],))
+            if "UPDATE work_metadata" in sql:
+                state["ai_title"] = params["ai_title"]
+                return types.SimpleNamespace(rowcount=1)
+            raise AssertionError(sql)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    return _Session
+
+
+def _empty_rollback_metadata():
+    return {"ai_translation": [], "renamed_files": [], "folder_renamed": []}
+
+
+@pytest.mark.asyncio
+async def test_rollback_ai_title_restores_folder_then_file_then_title_and_is_idempotent(tmp_path):
+    import os
+
+    old_folder = tmp_path / "RJ01000001 原标题"
+    new_folder = tmp_path / "RJ01000001 汉化标题"
+    new_folder.mkdir()
+    (new_folder / "音轨汉化.wav").write_bytes(b"audio")
+    old_file = old_folder / "音轨原.wav"
+    current_file_before_folder_restore = old_folder / "音轨汉化.wav"
+    metadata = {
+        "ai_translation": [{
+            "rjcode": "RJ01000001",
+            "original_ai_title": "旧 AI 标题",
+            "written_ai_title": "汉化标题",
+            "write_status": "success",
+            "rollback_status": "pending",
+        }],
+        "renamed_files": [{
+            "rjcode": "RJ01000001",
+            "library_id": "lib-a",
+            "old_name": old_file.name,
+            "new_name": current_file_before_folder_restore.name,
+            "old_path": str(old_file),
+            "new_path": str(current_file_before_folder_restore),
+            "status": "ok",
+            "rollback_status": "pending",
+        }],
+        "folder_renamed": [{
+            "rjcode": "RJ01000001",
+            "library_id": "lib-a",
+            "old_name": old_folder.name,
+            "new_name": new_folder.name,
+            "old_path": str(old_folder),
+            "new_path": str(new_folder),
+            "success": True,
+            "rollback_status": "pending",
+        }],
+    }
+    manager = _RollbackRenameManager()
+    db_state = {"ai_title": "汉化标题"}
+    task = _rollback_task(metadata)
+    service = AITitleTranslationService()
+
+    result = await service.rollback_task_changes(
+        task,
+        library_manager=manager,
+        session_factory=_rollback_session_factory(db_state),
+    )
+
+    assert result["success"] is True
+    assert result["restored_count"] == 3
+    assert old_file.read_bytes() == b"audio"
+    assert not new_folder.exists()
+    assert db_state["ai_title"] == "旧 AI 标题"
+    assert [os.path.basename(call[1]) for call in manager.calls] == [new_folder.name, current_file_before_folder_restore.name]
+    assert metadata["folder_renamed"][0]["rollback_status"] == "restored"
+    assert metadata["renamed_files"][0]["rollback_status"] == "restored"
+    assert metadata["ai_translation"][0]["rollback_status"] == "restored"
+
+    repeated = await service.rollback_task_changes(
+        task,
+        library_manager=manager,
+        session_factory=_rollback_session_factory(db_state),
+    )
+    assert repeated["already_restored"] is True
+    assert len(manager.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_rollback_ai_title_does_not_override_later_title_edit():
+    metadata = _empty_rollback_metadata()
+    metadata["ai_translation"] = [{
+        "rjcode": "RJ01000002",
+        "original_ai_title": "任务前标题",
+        "written_ai_title": "任务写入标题",
+        "write_status": "success",
+        "rollback_status": "pending",
+    }]
+    db_state = {"ai_title": "用户后来手工修改"}
+    task = _rollback_task(metadata)
+
+    result = await AITitleTranslationService().rollback_task_changes(
+        task,
+        library_manager=_RollbackRenameManager(),
+        session_factory=_rollback_session_factory(db_state),
+    )
+
+    assert result["restored_count"] == 0
+    assert result["skipped_count"] == 1
+    assert db_state["ai_title"] == "用户后来手工修改"
+    assert metadata["ai_translation"][0]["rollback_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_rollback_ai_title_skips_conflicting_folder_but_restores_safe_file(tmp_path):
+    old_folder = tmp_path / "原目录"
+    new_folder = tmp_path / "汉化目录"
+    old_folder.mkdir()
+    new_folder.mkdir()
+    current_file = tmp_path / "音轨汉化.wav"
+    original_file = tmp_path / "音轨原.wav"
+    current_file.write_bytes(b"audio")
+    metadata = _empty_rollback_metadata()
+    metadata["folder_renamed"] = [{
+        "library_id": "lib-a",
+        "old_name": old_folder.name,
+        "new_name": new_folder.name,
+        "old_path": str(old_folder),
+        "new_path": str(new_folder),
+        "success": True,
+        "rollback_status": "pending",
+    }]
+    metadata["renamed_files"] = [
+        {
+            "library_id": "lib-a",
+            "old_name": original_file.name,
+            "new_name": current_file.name,
+            "old_path": str(original_file),
+            "new_path": str(current_file),
+            "status": "ok",
+            "rollback_status": "pending",
+        },
+        {"old_name": "原失败项.wav", "new_name": "失败项.wav", "status": "failed"},
+    ]
+    manager = _RollbackRenameManager()
+
+    result = await AITitleTranslationService().rollback_task_changes(
+        _rollback_task(metadata),
+        library_manager=manager,
+        session_factory=_rollback_session_factory({"ai_title": ""}),
+    )
+
+    assert result["restored_count"] == 1
+    assert result["skipped_count"] == 1
+    assert original_file.read_bytes() == b"audio"
+    assert metadata["folder_renamed"][0]["rollback_status"] == "skipped"
+    assert metadata["renamed_files"][0]["rollback_status"] == "restored"
+    assert len(manager.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rollback_ai_title_rejects_legacy_task_without_complete_snapshot():
+    with pytest.raises(ValueError, match="缺少完整回退快照"):
+        await AITitleTranslationService().rollback_task_changes(
+            _rollback_task({
+                "ai_translation": [{"rjcode": "RJ01000003", "translated_title": "旧任务标题"}],
+                "renamed_files": [],
+            }),
+            library_manager=_RollbackRenameManager(),
+            session_factory=_rollback_session_factory({"ai_title": "旧任务标题"}),
+        )
+
+
+# ---------------------------------------------------------------------------
+# AI 字幕配对：正式 JSON 只接受答案字段，不接受思考草稿或截断输出。
+# ---------------------------------------------------------------------------
+
+def _subtitle_fake_litellm(response):
+    async def acompletion(**_kwargs):
+        return response
+
+    return types.SimpleNamespace(acompletion=acompletion)
+
+
+@pytest.mark.asyncio
+async def test_ai_subtitle_non_stream_reasoning_draft_json_is_not_formal_answer():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    response = {
+        "choices": [{
+            "message": {
+                "content": "",
+                "reasoning_content": '草稿：{"matches":[{"audio_id":"a","subtitle_group_id":"s"}]}',
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"completion_tokens": 20},
+    }
+    with pytest.raises(ValueError, match="思考"):
+        await AISubtitleMatchService()._complete_non_streaming(
+            _subtitle_fake_litellm(response), {}, request_label="test-reasoning"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ai_subtitle_stream_reasoning_only_is_rejected():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    stream = _FakeStream([
+        _delta_chunk({"content": "", "reasoning_content": '草稿 {"matches":[]}'}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    with pytest.raises(ValueError, match="思考"):
+        await AISubtitleMatchService()._complete_streaming(
+            _subtitle_fake_litellm(stream), {}, request_label="test-stream-reasoning"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ai_subtitle_stream_length_is_rejected_even_with_json():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    stream = _FakeStream([
+        _delta_chunk({"content": '{"matches":[]}'}, finish_reason="length"),
+    ])
+    with pytest.raises(ValueError, match="截断"):
+        await AISubtitleMatchService()._complete_streaming(
+            _subtitle_fake_litellm(stream), {}, request_label="test-stream-length"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ai_subtitle_non_stream_length_is_rejected_even_with_json():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    response = {
+        "choices": [{"message": {"content": '{"matches":[]}'}, "finish_reason": "length"}],
+        "usage": {"completion_tokens": 20},
+    }
+    with pytest.raises(ValueError, match="截断"):
+        await AISubtitleMatchService()._complete_non_streaming(
+            _subtitle_fake_litellm(response), {}, request_label="test-non-stream-length"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ai_subtitle_normal_content_json_remains_compatible():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    stream = _FakeStream([
+        _delta_chunk({"content": '{"matches":['}),
+        _delta_chunk({"content": '] }'}, finish_reason="stop"),
+    ])
+    content, _usage = await AISubtitleMatchService()._complete_streaming(
+        _subtitle_fake_litellm(stream), {}, request_label="test-normal-json"
+    )
+    assert content == '{"matches":[] }'
+
+
+def test_ai_subtitle_empty_object_is_malformed():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    with pytest.raises(ValueError, match="matches"):
+        AISubtitleMatchService()._validate_ai_response({}, {}, {}, 85)
+
+
+@pytest.mark.asyncio
+async def test_title_non_stream_reasoning_uses_reasoning_answer_extraction(monkeypatch):
+    response = {
+        "choices": [{
+            "message": {
+                "content": "",
+                "reasoning_content": '草稿 {"タイトル":"错误草稿"}\n翻译：\n非流式正确标题',
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"completion_tokens": 20},
+    }
+    _install_fake_litellm(monkeypatch, [response])
+
+    result = await AITitleTranslationService().translate_single("タイトル", _config(max_retries=0))
+
+    assert result["success"] is True, result
+    assert result["translated_title"] == "非流式正确标题"
