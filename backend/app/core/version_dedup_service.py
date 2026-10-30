@@ -4,6 +4,7 @@
 繁體中文）携带同一内容时自动去重，并优先保留简体中文目录下的版本。
 
 判重口径：
+- 只比较不同且可识别的多语言版本目录；同一版本目录及普通目录不参与清理。
 - 非文本文件：扩展名 + 文件大小 + 首尾各 1MB 的 SHA1 指纹完全一致才算重复。
 - 文本文件（.lrc/.srt/.vtt/.ass/.ssa/.txt）：内容经繁体转简体归一化后指纹
   一致即判重，覆盖「简繁版本几乎无差异」的常见多版本结构；不依赖文件名。
@@ -32,6 +33,13 @@ PREFERRED_LANG_MARKERS = (
     "简体", "簡体", "汉化", "漢化",
 )
 
+# 只有这些目录之间才属于“多语言版本查重”的适用范围。
+VERSION_LANG_MARKERS = PREFERRED_LANG_MARKERS + (
+    "繁體中文", "繁体中文", "繁體", "繁体",
+    "zh-hant", "zh_tw", "cht",
+    "日本語", "日语", "日語",
+)
+
 # 首尾指纹各读 1MB
 _FINGERPRINT_CHUNK = 1024 * 1024
 
@@ -44,6 +52,17 @@ def language_priority_of(relative_path: str) -> Optional[int]:
     for marker in PREFERRED_LANG_MARKERS:
         if marker.casefold() in normalized:
             return 0
+    return None
+
+
+def _version_root_of(relative_path: str) -> Optional[str]:
+    """返回语言版本目录的相对路径；普通目录不参与版本查重。"""
+    normalized = str(relative_path or "").replace("\\", "/").strip("/")
+    parts = [part for part in normalized.split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        folded = part.casefold()
+        if any(marker.casefold() in folded for marker in VERSION_LANG_MARKERS):
+            return "/".join(parts[:index + 1]).casefold()
     return None
 
 
@@ -167,9 +186,21 @@ async def deduplicate_version_files(root: str, task: Any) -> Dict[str, Any]:
     for items in groups.values():
         if len(items) < 2:
             continue
-        winner = _pick_winner(items)
+        versioned_items = []
+        version_roots = set()
         for item in items:
-            if item is winner:
+            version_root = _version_root_of(item["relative_path"])
+            if version_root is None:
+                continue
+            versioned_items.append(item)
+            version_roots.add(version_root)
+        # 内容相同不等于多语言重复版本：同目录的连续音轨、空字幕等必须保留。
+        if len(version_roots) < 2:
+            continue
+        winner = _pick_winner(versioned_items)
+        winner_version_root = _version_root_of(winner["relative_path"])
+        for item in versioned_items:
+            if _version_root_of(item["relative_path"]) == winner_version_root:
                 continue
             try:
                 recovery = await asyncio.to_thread(

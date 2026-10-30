@@ -139,6 +139,114 @@ def test_directory_recovery_can_restore_only_one_nested_file(tmp_path):
     assert (payload_root / "nested" / "keep-filtered.txt").read_bytes() == b"keep-filtered"
 
 
+def test_library_delete_moves_directory_to_recovery_and_can_restore(monkeypatch, tmp_path):
+    library_root = tmp_path / "library"
+    output = library_root / "RJ00000001"
+    nested = output / "sub" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "one.txt").write_bytes(b"one")
+    (nested / "two.txt").write_bytes(b"two")
+
+    class _Db:
+        def query(self, *_args):
+            return self
+
+        def filter(self, *_args):
+            return self
+
+        def first(self):
+            return None
+
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+    task = SimpleNamespace(
+        id="task-1",
+        status=TaskStatus.COMPLETED,
+        output_path=str(output),
+        task_metadata={"filtered_items": []},
+        touch_metadata=lambda _reason: None,
+    )
+    engine = SimpleNamespace(
+        get_task=lambda task_id: task if task_id == task.id else None,
+        persist_task_snapshot=lambda _task: None,
+    )
+    library = SimpleNamespace(id="local-1", type="local", root_path=str(library_root))
+    index_calls = []
+
+    class _Manager:
+        def get_library_definition(self, library_id):
+            return library if library_id == library.id else None
+
+        def find_local_library_for_path(self, _path):
+            return library
+
+        def _assert_local_path_in_library(self, _library, path):
+            assert Path(path).is_relative_to(library_root)
+
+        def _invalidate_local_browse_caches(self, _library_id):
+            return None
+
+        def _local_top_level_delta(self, _library, _path, _delta):
+            return None
+
+        def _notify_index_self_mutation_delete(self, _library, path, **kwargs):
+            index_calls.append(("delete", path, kwargs))
+            return {"operation_id": "operation-1"}
+
+        def _notify_index_self_mutation_upsert_subtree(self, _library, path):
+            index_calls.append(("upsert", path))
+
+        def _append_stats_log(self, *_args):
+            return None
+
+    monkeypatch.setattr("app.models.database.SessionLocal", lambda: _Db())
+    monkeypatch.setattr("app.core.task_engine.get_task_engine", lambda: engine)
+    monkeypatch.setattr("app.core.library_manager.get_library_manager", lambda: _Manager())
+    monkeypatch.setattr("app.core.activity_log_service.write_activity_log", lambda *args, **kwargs: None)
+
+    recovery = FilterRecoveryService(str(tmp_path / "recovery"))
+    deleted = asyncio.run(recovery.delete_library_item(
+        "engine:task-1",
+        "sub",
+        library_id=library.id,
+    ))
+
+    assert deleted["recovery_status"] == "available"
+    assert deleted["operation_id"] == "operation-1"
+    assert not (output / "sub").exists()
+    manifest = recovery._read_manifest("task-1")
+    assert len(manifest["items"]) == 1
+    item = manifest["items"][0]
+    assert item["origin"] == "library_delete"
+    payload = recovery._payload_path("task-1", item)
+    assert (payload / "nested" / "one.txt").read_bytes() == b"one"
+    assert (payload / "nested" / "two.txt").read_bytes() == b"two"
+    assert task.task_metadata["filtered_items"][0]["recovery_id"] == item["recovery_id"]
+    assert task.task_metadata["filter_recovery"]["available_count"] == 1
+    assert index_calls[0][2]["scope"] == "subtree"
+
+    asyncio.run(recovery.restore_item("engine:task-1", item["recovery_id"]))
+
+    assert (nested / "one.txt").read_bytes() == b"one"
+    assert (nested / "two.txt").read_bytes() == b"two"
+    assert task.task_metadata["filtered_items"][0]["recovery_status"] == "restored"
+
+    deleted_again = asyncio.run(recovery.delete_library_item(
+        "engine:task-1",
+        "sub",
+        library_id=library.id,
+    ))
+
+    assert deleted_again["recovery_id"] != item["recovery_id"]
+    assert len(task.task_metadata["filtered_items"]) == 1
+    assert task.task_metadata["filtered_items"][0]["recovery_id"] == deleted_again["recovery_id"]
+    assert task.task_metadata["filtered_items"][0]["recovery_status"] == "available"
+
+
 def test_path_transforms_follow_flatten_operations():
     transformed = FilterRecoveryService.apply_path_transforms(
         "wrapper/inner/remove.wav",

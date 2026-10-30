@@ -2949,6 +2949,12 @@ class FilteredItemRestoreRequest(BaseModel):
     relative_path: Optional[str] = None
 
 
+class TaskCenterLibraryItemDeleteRequest(BaseModel):
+    relative_path: str
+    library_id: Optional[str] = None
+    confirmed: bool = False
+
+
 class ConfigResponse(BaseModel):
     storage: dict
     processing: dict
@@ -3508,6 +3514,41 @@ async def execute_task_center_action(item_id: str, payload: TaskCenterActionRequ
         return await service.execute_action(item_id, payload.action)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/task-center/{item_id}/library-items/delete")
+async def delete_task_center_library_item(
+    item_id: str,
+    payload: TaskCenterLibraryItemDeleteRequest,
+):
+    """把任务最终库存内容移入恢复区，而不是永久删除。"""
+    from ..core.filter_recovery_service import (
+        FilterRecoveryConflictError,
+        FilterRecoveryError,
+        get_filter_recovery_service,
+    )
+
+    if not payload.confirmed:
+        raise HTTPException(status_code=400, detail="删除库存内容需要明确确认")
+    try:
+        return await get_filter_recovery_service().delete_library_item(
+            item_id,
+            payload.relative_path,
+            library_id=str(payload.library_id or ""),
+        )
+    except FilterRecoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except FilterRecoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(
+            "任务库存内容移入恢复区失败: item_id=%s relative_path=%s error=%s",
+            item_id,
+            payload.relative_path,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"删除库存内容失败: {str(exc)}")
 
 
 @app.post("/api/task-center/{item_id}/filtered-items/{recovery_id}/restore")
@@ -9220,63 +9261,152 @@ async def retry_deferred_archive_job(job_id: str):
 
 @app.post("/api/processed-archives/{archive_id}/reprocess")
 async def reprocess_archive(archive_id: str):
-    """重新处理已归档的压缩包"""
+    """从已归档压缩包重新完整解压入库，不依赖旧库存输出目录。"""
+    from ..core.task_engine import TaskStatus
     from ..models.database import ProcessedArchive, get_db
-    
+
     db = next(get_db())
     try:
         archive = db.query(ProcessedArchive).filter(ProcessedArchive.id == archive_id).first()
         if not archive:
             raise HTTPException(status_code=404, detail="压缩包记录不存在")
-        
-        # 检查文件是否还存在
-        if not os.path.exists(archive.current_path):
-            raise HTTPException(status_code=404, detail="压缩包文件不存在，可能已被删除")
-        
-        # 直接从 processed 目录解压，避免复制到 SSD
-        logger.info(f"直接从 processed 目录重新解压: {archive.current_path}")
-        
-        # 检查是否已有处理同RJ号的现存任务
-        engine = get_task_engine()
-        existing_tasks_for_rj = [t for t in engine.get_all_tasks()
-                               if t.rjcode == archive.rjcode]
 
-        if existing_tasks_for_rj:
-            # 复用已有任务
-            task = existing_tasks_for_rj[0]
+        archive_status = str(archive.status or "").strip().lower()
+        if archive_status == "reprocessing":
+            raise HTTPException(status_code=409, detail="压缩包正在重新处理，请勿重复提交")
+        if archive_status not in {"completed", "failed"}:
+            raise HTTPException(status_code=409, detail="当前归档状态不允许重新解压")
+        if not archive.current_path or not os.path.exists(archive.current_path):
+            raise HTTPException(status_code=404, detail="压缩包文件不存在，可能已被删除")
+
+        logger.info(f"直接从 processed 目录重新解压: {archive.current_path}")
+
+        engine = get_task_engine()
+        archive_rjcode = str(archive.rjcode or "").strip().upper()
+        existing_tasks_for_rj = [
+            task for task in engine.get_all_tasks(include_hidden=True)
+            if archive_rjcode and str(task.rjcode or "").strip().upper() == archive_rjcode
+        ]
+        active_statuses = {
+            TaskStatus.PENDING.value,
+            TaskStatus.PROCESSING.value,
+            TaskStatus.PAUSED.value,
+            TaskStatus.WAITING_RETRY.value,
+        }
+        active_task = next(
+            (
+                task for task in existing_tasks_for_rj
+                if (
+                    (task.status.value if isinstance(task.status, TaskStatus) else str(task.status or ""))
+                    in active_statuses
+                    or task.id in engine.processing
+                )
+            ),
+            None,
+        )
+        if active_task:
+            raise HTTPException(
+                status_code=409,
+                detail=f"同 RJ 号任务仍在处理或等待重试，不能重复重新解压（任务 {active_task.id}）",
+            )
+
+        auto_process_tasks = [
+            task for task in existing_tasks_for_rj
+            if task.type == TaskType.AUTO_PROCESS
+        ]
+        task = next(
+            (candidate for candidate in auto_process_tasks if candidate.id == archive.task_id),
+            auto_process_tasks[0] if auto_process_tasks else None,
+        )
+
+        if task:
             original_source = task.source_path
             old_status = task.status
+            metadata = dict(task.task_metadata or {})
+            runtime_keys = {
+                "final_file_tree_items",
+                "extracted_file_tree_items",
+                "file_tree_items",
+                "filtered_items",
+                "filtered_files",
+                "filtered_dirs",
+                "filtered_count",
+                "filtered_size",
+                "filter_recovery",
+                "filter_path_transforms",
+                "file_dedup_removed",
+                "skip_retry_precheck",
+                "manual_retry_password_requested",
+                "skip_duplicate_precheck",
+                "progress_log",
+                "progress_log_compacted",
+                "temp_extract_path",
+                "temp_extract_path_cleaned",
+                "temp_extract_path_cleaned_at",
+                "hidden_in_task_lists",
+                "awaiting_manual_match",
+                "manual_match_completed",
+                "cancel_reason",
+                "pause_origin_status",
+                "failure_stage",
+                "error_message",
+                "raw_error_message",
+                "available_actions",
+                "extract_failure_reason",
+                "garbled_filename_bypassed",
+                "replace_inventory_empty_shell",
+                "linked_subtitle_preview",
+                "disguised_volume_set",
+                "nested_subtitle_archive_filenames",
+                "resume_from_stage",
+            }
+            runtime_prefixes = (
+                "retry_",
+                "conflict_resolution_",
+                "rename_retry_",
+                "superseded_",
+                "multi_rj_",
+                "inventory_empty_shell_",
+                "stale_",
+            )
+            for key in list(metadata):
+                if key in runtime_keys or key.startswith(runtime_prefixes):
+                    metadata.pop(key, None)
+
+            task.task_metadata = metadata
             task.source_path = archive.current_path
-            task.skip_archive = True  # 标记跳过归档（因为文件已在 processed 目录）
-            task.status = TaskStatus.PENDING
-            task.update_progress(0, "待处理")
-            # 将任务加入队列以供 worker 执行
+            task.output_path = None
+            task.skip_archive = True
+            task.reset_for_rerun("等待重新解压")
             await engine.queue.put(task)
-            logger.info(f"复用现有RJ号任务: {task.id}, 源路径: {original_source} -> {task.source_path}, RJ: {archive.rjcode}, 状态: {old_status} -> {task.status}")
+            task.mark_changed("submitted")
+            logger.info(
+                f"复用现有自动入库任务: {task.id}, 源路径: {original_source} -> {task.source_path}, "
+                f"RJ: {archive.rjcode}, 状态: {old_status} -> {task.status}"
+            )
         else:
-            # 创建新任务（标记为重新处理，直接从 processed 目录解压）
             task = Task(
                 task_type=TaskType.AUTO_PROCESS,
-                source_path=archive.current_path,  # 直接使用 processed 目录中的文件
+                source_path=archive.current_path,
                 auto_classify=get_config().watcher.auto_classify,
-                skip_archive=True  # 标记跳过归档（因为文件已在 processed 目录）
+                skip_archive=True,
+                rjcode=archive.rjcode or None,
             )
             await engine.submit(task)
-            # 注意：submit 会自动添加 task 到 engine.tasks 和队列中
-        
-        # 更新记录状态和重新处理时间
-        archive.status = 'reprocessing'
+
+        archive.status = "reprocessing"
         archive.processed_at = datetime.now()
         archive.process_count = (archive.process_count or 0) + 1
+        archive.task_id = task.id
         db.commit()
-        
+
         return {
             "message": "已创建重新处理任务",
             "task_id": task.id,
             "filename": archive.filename,
-            "rjcode": archive.rjcode
+            "rjcode": archive.rjcode,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -19233,6 +19363,15 @@ def _serialize_http_download_task(task, *, compact: bool = False) -> dict:
     metadata = _task_metadata_with_redis_runtime(task)
     download_mode = str(metadata.get("download_mode") or "http")
     is_baidu_netdisk = download_mode == "baidu_netdisk" or metadata.get("task_domain") == "baidu_netdisk"
+    task_domain = str(
+        metadata.get("task_domain")
+        or ("baidu_netdisk" if is_baidu_netdisk else "http_download")
+    )
+    task_kind = str(
+        metadata.get("task_kind")
+        or getattr(getattr(task, "type", None), "value", getattr(task, "type", ""))
+        or ""
+    )
     failed_files = [
         item for item in list(metadata.get("failed_files") or [])
         if isinstance(item, dict)
@@ -19321,6 +19460,8 @@ def _serialize_http_download_task(task, *, compact: bool = False) -> dict:
         "progress_log": metadata.get("progress_log", []),
         "performance_metrics": performance_metrics,
         "download_mode": download_mode,
+        "task_domain": task_domain,
+        "task_kind": task_kind,
         "session_id": metadata.get("session_id", ""),
         "queue_priority": metadata.get("queue_priority", metadata.get("priority", 100)),
         "task_metadata": {
@@ -19336,6 +19477,8 @@ def _serialize_http_download_task(task, *, compact: bool = False) -> dict:
             "url_count": metadata.get("url_count", 0),
             "retry_count": metadata.get("retry_count", 0),
             "download_mode": download_mode,
+            "task_domain": task_domain,
+            "task_kind": task_kind,
             "source_modes": metadata.get("source_modes", []),
             "platforms": metadata.get("platforms", []),
             "platform_label": metadata.get("platform_label", ""),

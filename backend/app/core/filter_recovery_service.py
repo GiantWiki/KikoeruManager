@@ -339,6 +339,161 @@ class FilterRecoveryService:
                 current = f"{parent}/{suffix}" if parent else suffix
         return FilterRecoveryService._normalize_relative_path(current)
 
+    async def delete_library_item(
+        self,
+        item_id: str,
+        relative_path: str,
+        *,
+        library_id: str = "",
+    ) -> Dict[str, Any]:
+        """把任务最终库存中的本地文件/目录移入同一任务的恢复区。"""
+        task_id = self._task_id_from_item_id(item_id)
+        normalized_relative_path = self._normalize_relative_path(relative_path)
+        lock = self._task_lock(task_id)
+        acquired = await asyncio.to_thread(lock.acquire, False)
+        if not acquired:
+            raise FilterRecoveryConflictError("该任务已有文件正在还原或删除")
+        try:
+            return await asyncio.to_thread(
+                self._delete_library_item_locked,
+                task_id,
+                normalized_relative_path,
+                str(library_id or "").strip(),
+            )
+        finally:
+            lock.release()
+
+    def _delete_library_item_locked(
+        self,
+        task_id: str,
+        relative_path: str,
+        library_id: str,
+    ) -> Dict[str, Any]:
+        from ..models.database import SessionLocal, Task as TaskRecord
+        from .library_manager import get_library_manager
+        from .task_engine import TaskStatus, get_task_engine
+
+        engine = get_task_engine()
+        live_task = engine.get_task(task_id)
+        db = SessionLocal()
+        try:
+            record = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+            if live_task is None and record is None:
+                raise FilterRecoveryError("任务记录不存在")
+            status = (
+                live_task.status.value
+                if live_task is not None and hasattr(live_task.status, "value")
+                else str(getattr(record, "status", "") or "")
+            )
+            if status != TaskStatus.COMPLETED.value:
+                raise FilterRecoveryError("仅已完成任务支持删除库存内容")
+
+            metadata = dict(
+                (live_task.task_metadata if live_task is not None else record.task_metadata)
+                or {}
+            )
+            manifest = self._read_manifest(task_id, required=False)
+            target = dict(manifest.get("target") or {})
+            target_root_text = str(target.get("root") or "").strip() if target.get("ready") else ""
+            if not target_root_text:
+                target_root_text = str(
+                    getattr(live_task if live_task is not None else record, "output_path", "") or ""
+                ).strip()
+            if not target_root_text:
+                raise FilterRecoveryError("任务尚未确定最终入库位置")
+
+            selected_library_id = (
+                library_id
+                or str(metadata.get("target_library_id") or "").strip()
+                or str(target.get("library_id") or "").strip()
+            )
+            manager = get_library_manager()
+            library = manager.get_library_definition(selected_library_id) if selected_library_id else None
+            if library is None:
+                library = manager.find_local_library_for_path(target_root_text)
+            if library is None:
+                raise FilterRecoveryError("只能删除库存内的文件或目录")
+            if getattr(library, "type", None) != "local":
+                raise FilterRecoveryError("远程库存暂不支持可恢复删除，未执行任何删除")
+
+            root = Path(target_root_text).resolve()
+            source = (root / Path(relative_path)).resolve()
+            self._assert_inside(root, source)
+            manager._assert_local_path_in_library(library, str(source))
+            if not source.exists():
+                raise FilterRecoveryError("要删除的库存内容不存在")
+
+            def contains(parent: str, child: str) -> bool:
+                return child == parent or child.startswith(f"{parent.rstrip('/')}/")
+
+            for existing in manifest.get("items") or []:
+                if existing.get("recovery_status") != "available":
+                    continue
+                existing_path = str(existing.get("relative_path") or "").strip("/")
+                if existing_path and (
+                    contains(existing_path, relative_path)
+                    or contains(relative_path, existing_path)
+                ):
+                    raise FilterRecoveryConflictError(
+                        "该路径已有相关的待恢复项目，请先还原后再删除"
+                    )
+
+            was_directory = source.is_dir()
+            expected_size = self._path_size(source)
+            manifest["target"] = {
+                "ready": True,
+                "root": str(root),
+                "library_id": str(getattr(library, "id", "") or ""),
+            }
+            self._write_manifest(task_id, manifest)
+            captured = self.capture_item(
+                task_id,
+                str(source),
+                relative_path=relative_path,
+                entry_type="dir" if was_directory else "file",
+                size=expected_size,
+            )
+
+            manifest = self._read_manifest(task_id)
+            captured_item = next(
+                item for item in manifest.get("items") or []
+                if item.get("recovery_id") == captured.get("recovery_id")
+            )
+            captured_item["origin"] = "library_delete"
+            captured_item["deleted_at"] = datetime.now().isoformat()
+            self._write_manifest(task_id, manifest)
+
+            manager._invalidate_local_browse_caches(library.id)
+            if was_directory:
+                manager._local_top_level_delta(library, str(source), -1)
+            index_mutation = manager._notify_index_self_mutation_delete(
+                library,
+                str(source),
+                sync=True,
+                scope="subtree" if was_directory else "exact",
+            )
+            manager._append_stats_log(library, "INFO", f"库存内容已移入恢复区 path={source}")
+            self._sync_task_metadata(
+                engine, live_task, record, db, manifest, reason="library_item_deleted",
+            )
+
+            result = {
+                "success": True,
+                "message": f"已移入恢复区：{captured_item.get('name') or relative_path}",
+                "recovery_id": captured_item.get("recovery_id"),
+                "relative_path": relative_path,
+                "recovery_status": "available",
+            }
+            if isinstance(index_mutation, dict):
+                result.update({
+                    "operation_id": index_mutation.get("operation_id"),
+                    "operation_state": index_mutation.get("operation_state"),
+                    "index_fences": list(index_mutation.get("index_fences") or []),
+                })
+            return result
+        finally:
+            db.close()
+
     async def restore_item(
         self,
         item_id: str,
@@ -581,21 +736,55 @@ class FilterRecoveryService:
         )
         return str(restored_path)
 
-    def _sync_task_metadata(self, engine: Any, live_task: Any, record: Any, db: Any, manifest: Dict[str, Any]) -> None:
+    def _sync_task_metadata(
+        self,
+        engine: Any,
+        live_task: Any,
+        record: Any,
+        db: Any,
+        manifest: Dict[str, Any],
+        *,
+        reason: str = "filtered_item_restored",
+    ) -> None:
         def merge(metadata: Dict[str, Any]) -> Dict[str, Any]:
             updated = dict(metadata or {})
-            by_id = {str(entry.get("recovery_id") or ""): entry for entry in manifest.get("items") or []}
+            manifest_items = list(manifest.get("items") or [])
+            by_id = {str(entry.get("recovery_id") or ""): entry for entry in manifest_items}
+            # 同一路径允许“还原后再次删除”，只保留最新恢复项，避免前端按路径去重时吞掉新记录。
+            latest_id_by_path = {
+                str(entry.get("relative_path") or ""): str(entry.get("recovery_id") or "")
+                for entry in manifest_items
+                if str(entry.get("relative_path") or "")
+            }
             filtered_items = []
+            seen_ids = set()
             for current in updated.get("filtered_items") or []:
-                recovery = by_id.get(str(current.get("recovery_id") or ""))
-                filtered_items.append({**current, **recovery} if recovery else current)
+                recovery_id = str(current.get("recovery_id") or "")
+                recovery = by_id.get(recovery_id)
+                current_path = str((recovery or current).get("relative_path") or "")
+                if current_path and latest_id_by_path.get(current_path, recovery_id) != recovery_id:
+                    continue
+                if recovery is not None:
+                    filtered_items.append({**current, **recovery})
+                    seen_ids.add(recovery_id)
+                else:
+                    filtered_items.append(current)
+            for recovery in manifest_items:
+                recovery_id = str(recovery.get("recovery_id") or "")
+                recovery_path = str(recovery.get("relative_path") or "")
+                if not recovery_id or recovery_id in seen_ids:
+                    continue
+                if recovery_path and latest_id_by_path.get(recovery_path) != recovery_id:
+                    continue
+                filtered_items.append(dict(recovery))
+                seen_ids.add(recovery_id)
             updated["filtered_items"] = filtered_items
             updated["filter_recovery"] = self._public_summary(manifest)
             return updated
 
         if live_task is not None:
             live_task.task_metadata = merge(dict(live_task.task_metadata or {}))
-            live_task.touch_metadata("filtered_item_restored")
+            live_task.touch_metadata(reason)
             engine.persist_task_snapshot(live_task)
             return
         record.task_metadata = merge(dict(record.task_metadata or {}))
@@ -619,7 +808,7 @@ class FilterRecoveryService:
 
             broadcast_event({
                 "type": "task.center.changed",
-                "reason": "filtered_item_restored",
+                "reason": reason,
                 "id": f"engine:{record.id}",
                 "domain": "import",
                 "status": str(record.status or ""),

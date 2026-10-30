@@ -77,6 +77,71 @@ async def test_deduplicate_keeps_simplified_chinese_audio(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_deduplicate_keeps_same_directory_numbered_tracks(tmp_path, monkeypatch):
+    """普通目录里的连续音轨及同名 VTT 不属于多语言版本，不能按内容去重。"""
+    root = tmp_path / "work"
+    contents = {
+        "01": b"dice-a",
+        "02": b"dice-b",
+        "03": b"dice-c",
+        "04": b"dice-d",
+        "05": b"dice-e",
+        "06": b"dice-d",
+        "07": b"dice-c",
+        "08": b"dice-b",
+    }
+    for number, content in contents.items():
+        _write(str(root / f"音声/骰子/骰子{number}.wav"), content)
+        _write(str(root / f"音声/骰子/骰子{number}.wav.vtt"), "WEBVTT\n")
+
+    service = FilterRecoveryService(recovery_root=str(tmp_path / "recovery"))
+    monkeypatch.setattr("app.core.filter_recovery_service.get_filter_recovery_service", lambda: service)
+
+    result = await deduplicate_version_files(str(root), SimpleNamespace(id="t-dice"))
+
+    assert result["removed_count"] == 0
+    for number in contents:
+        assert os.path.exists(str(root / f"音声/骰子/骰子{number}.wav"))
+        assert os.path.exists(str(root / f"音声/骰子/骰子{number}.wav.vtt"))
+
+
+@pytest.mark.asyncio
+async def test_deduplicate_does_not_remove_plain_directory_copy(tmp_path, monkeypatch):
+    """多语言版本可以互判，但不能连带删除普通目录里的同内容文件。"""
+    root = tmp_path / "work"
+    for rel in ["简体中文/WAV/01.wav", "繁體中文/WAV/01.wav", "音声/骰子/骰子06.wav"]:
+        _write(str(root / rel), b"shared-audio")
+
+    service = FilterRecoveryService(recovery_root=str(tmp_path / "recovery"))
+    monkeypatch.setattr("app.core.filter_recovery_service.get_filter_recovery_service", lambda: service)
+
+    result = await deduplicate_version_files(str(root), SimpleNamespace(id="t-mixed-dirs"))
+
+    assert result["removed_count"] == 1
+    assert os.path.exists(str(root / "简体中文/WAV/01.wav"))
+    assert not os.path.exists(str(root / "繁體中文/WAV/01.wav"))
+    assert os.path.exists(str(root / "音声/骰子/骰子06.wav"))
+
+
+@pytest.mark.asyncio
+async def test_deduplicate_preserves_copies_inside_winning_language_root(tmp_path, monkeypatch):
+    """跨语言判重不能连带清理胜者语言根内部的同内容副本。"""
+    root = tmp_path / "work"
+    for rel in ["简体中文/a.wav", "简体中文/copy/a.wav", "繁體中文/a.wav"]:
+        _write(str(root / rel), b"shared-audio")
+
+    service = FilterRecoveryService(recovery_root=str(tmp_path / "recovery"))
+    monkeypatch.setattr("app.core.filter_recovery_service.get_filter_recovery_service", lambda: service)
+
+    result = await deduplicate_version_files(str(root), SimpleNamespace(id="t-same-language-copy"))
+
+    assert result["removed_count"] == 1
+    assert os.path.exists(str(root / "简体中文/a.wav"))
+    assert os.path.exists(str(root / "简体中文/copy/a.wav"))
+    assert not os.path.exists(str(root / "繁體中文/a.wav"))
+
+
+@pytest.mark.asyncio
 async def test_deduplicate_normalizes_simplified_traditional_text(tmp_path, monkeypatch):
     """简繁文本内容一致（仅字体差异）时判重，保留简体路径版本。"""
     root = tmp_path / "work"
