@@ -1361,6 +1361,23 @@ function buildTaskFileTreeSections(item) {
 
   if (hasSnapshotTree) {
     sourceItems.push(...mapFileTreeItems(snapshot.items))
+    if (snapshot.kind === 'final') {
+      // 最终目录只含现存文件；已删除目录的后代需从过滤前快照恢复，才能逐文件还原。
+      const removedDirectories = removedItems
+        .filter(entry => entry.type === 'dir')
+        .map(entry => normalizeTaskFileTreePath(entry.relative_path))
+        .filter(Boolean)
+      if (removedDirectories.length) {
+        const historicalItems = Array.isArray(metadata.file_tree_items) && metadata.file_tree_items.length
+          ? metadata.file_tree_items
+          : metadata.extracted_file_tree_items
+        for (const historical of mapFileTreeItems(historicalItems)) {
+          if (removedDirectories.some(path => isSameOrInsideTaskTreePath(historical.relative_path, path))) {
+            sourceItems.push(historical)
+          }
+        }
+      }
+    }
   } else if (
     (Array.isArray(metadata.upload_files) && metadata.upload_files.length) ||
     (Array.isArray(metadata.uploaded_files) && metadata.uploaded_files.length)

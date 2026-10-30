@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import Tasks from './Tasks.vue'
+import TaskDetailPane from '../components/tasks/TaskDetailPane.vue'
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
@@ -69,7 +70,7 @@ async function mountTasks() {
         TasksHeader: true,
         TasksFilters: true,
         TaskListPane: true,
-        TaskDetailPane: { name: 'TaskDetailPane', template: '<div />' },
+        TaskDetailPane: { name: 'TaskDetailPane', props: ['fileTreeSections'], template: '<div />' },
       },
     },
   })
@@ -170,6 +171,90 @@ describe('任务中心批量恢复', () => {
 
     expect(mocks.restoreFilteredItem).toHaveBeenCalledWith('task-1', 'recovery-1', '')
     expect(mocks.success).toHaveBeenCalledWith('单文件已还原')
+    wrapper.unmount()
+  })
+
+  it('最终库存树保留已删除目录的历史子项并可逐文件恢复', async () => {
+    const treeTask = {
+      ...task,
+      details: {
+        metadata: {
+          filter_recovery: { target_ready: true },
+          final_file_tree_root_label: 'RJ00000001',
+          final_file_tree_items: [
+            { relative_path: '已删除目录', name: '已删除目录', type: 'dir' },
+            { relative_path: '现存文件.wav', name: '现存文件.wav', type: 'file' },
+          ],
+          file_tree_items: [
+            { relative_path: '已删除目录', name: '已删除目录', type: 'dir' },
+            { relative_path: '已删除目录/子目录', name: '子目录', type: 'dir' },
+            { relative_path: '已删除目录/子目录/台本.txt', name: '台本.txt', type: 'file', size: 12 },
+            { relative_path: '仅存于解压阶段的临时文件.tmp', name: '临时文件.tmp', type: 'file' },
+          ],
+          filtered_items: [{
+            relative_path: '已删除目录',
+            name: '已删除目录',
+            type: 'dir',
+            recovery_id: 'recovery-dir',
+            recovery_status: 'available',
+          }],
+        },
+      },
+    }
+    mocks.list.mockResolvedValue({ items: [treeTask], total: 1 })
+    mocks.getItem.mockResolvedValue(treeTask)
+    const wrapper = await mountTasks()
+    await flushPromises()
+    await flushPromises()
+
+    const sections = wrapper.findComponent({ name: 'TaskDetailPane' }).props('fileTreeSections')
+    expect(sections).toHaveLength(1)
+    const rows = sections[0].rows
+    const restoredFile = rows.find(row => row.key === 'RJ00000001/已删除目录/子目录/台本.txt')
+
+    expect(rows.some(row => row.key === 'RJ00000001/已删除目录/子目录')).toBe(true)
+    expect(restoredFile).toMatchObject({
+      status: 'removed',
+      recoveryId: 'recovery-dir',
+      recoveryRelativePath: '子目录/台本.txt',
+    })
+    expect(rows.some(row => String(row.key).includes('临时文件.tmp'))).toBe(false)
+    wrapper.unmount()
+  })
+})
+
+describe('任务文件树虚拟列表', () => {
+  it('虚拟器尚未测量时滚动仍能到达第40项之后', async () => {
+    const rows = Array.from({ length: 120 }, (_, index) => ({
+      key: `file-${index}`,
+      label: `文件 ${index}`,
+      relative_path: `file-${index}`,
+      type: 'file',
+      status: 'default',
+      depth: 0,
+      hasChildren: false,
+      expanded: false,
+      defaultExpanded: true,
+    }))
+    const wrapper = mount(TaskDetailPane, {
+      props: {
+        item: task,
+        fileTreeSections: [{ key: 'file-list', rows }],
+        formatRJCode: value => value,
+        formatDateTime: value => value,
+        showProgress: () => false,
+        getRecoveredNotice: () => '',
+        getDLsiteFailureReason: () => '',
+        getOutputPath: () => '',
+      },
+    })
+    await flushPromises()
+    const scroller = wrapper.find('.task-file-tree')
+    scroller.element.scrollTop = 90 * 34
+    await scroller.trigger('scroll')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('文件 90')
     wrapper.unmount()
   })
 })

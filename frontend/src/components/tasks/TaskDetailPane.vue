@@ -344,7 +344,7 @@
         </div>
 
         <div class="task-file-tree-card">
-            <div ref="treeScrollRef" class="task-file-tree detail-scroll">
+            <div ref="treeScrollRef" class="task-file-tree detail-scroll" @scroll="handleTreeScroll">
               <div class="task-file-tree-virtual-canvas" :style="treeVirtualCanvasStyle">
               <div
               v-for="{ virtualRow, entry } in virtualTreeRows"
@@ -542,6 +542,7 @@ const emit = defineEmits([
 
 const restoreMenu = ref(null)
 const treeScrollRef = ref(null)
+const fallbackTreeScrollTop = ref(0)
 const TREE_ROW_HEIGHT = 34
 const TREE_ROW_OVERSCAN = 18
 const treeRows = computed(() => props.fileTreeSections?.[0]?.rows || [])
@@ -570,17 +571,37 @@ const virtualTreeRows = computed(() => {
     .filter(item => item.entry)
   if (rows.length || !treeRows.value.length) return rows
 
-  // 首屏数据先于滚动容器测量完成时，虚拟器可能暂时返回空集合；先画少量行，测量完成后自动切回虚拟列表。
-  return treeRows.value.slice(0, 40).map((entry, index) => ({
-    entry,
-    virtualRow: {
-      index,
-      key: entry.key || index,
-      start: index * TREE_ROW_HEIGHT,
-      size: TREE_ROW_HEIGHT,
-    },
-  }))
+  // 虚拟器尚未测量时也按真实滚动位置渲染，避免始终停留在首屏。
+  const viewportHeight = treeScrollRef.value?.clientHeight || 560
+  const visibleCount = Math.ceil(viewportHeight / TREE_ROW_HEIGHT)
+  const startIndex = Math.max(
+    0,
+    Math.min(
+      Math.floor(fallbackTreeScrollTop.value / TREE_ROW_HEIGHT) - TREE_ROW_OVERSCAN,
+      Math.max(0, treeRows.value.length - visibleCount),
+    ),
+  )
+  const endIndex = Math.min(
+    treeRows.value.length,
+    startIndex + visibleCount + TREE_ROW_OVERSCAN * 2,
+  )
+  return treeRows.value.slice(startIndex, endIndex).map((entry, offset) => {
+    const index = startIndex + offset
+    return {
+      entry,
+      virtualRow: {
+        index,
+        key: entry.key || index,
+        start: index * TREE_ROW_HEIGHT,
+        size: TREE_ROW_HEIGHT,
+      },
+    }
+  })
 })
+
+function handleTreeScroll(event) {
+  fallbackTreeScrollTop.value = Math.max(0, Number(event?.currentTarget?.scrollTop) || 0)
+}
 const treeVirtualCanvasStyle = computed(() => ({
   height: `${Math.max(
     treeRowVirtualizer.value.getTotalSize(),
