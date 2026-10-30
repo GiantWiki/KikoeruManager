@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -650,6 +650,234 @@ def _stub_task_engine_side_effects(monkeypatch, engine):
     monkeypatch.setattr(engine, "unmark_rjcode_processing", Mock())
     monkeypatch.setattr("app.core.activity_log_service.log_task_lifecycle_event", Mock())
     monkeypatch.setattr("app.core.task_notification_service.enqueue_notification_check", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_pending_task_submit_persists_and_start_restores_queue(monkeypatch):
+    """普通 pending 任务必须在重启后恢复内存列表和执行队列。"""
+    TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    task = Task(
+        TaskType.HTTP_DOWNLOAD,
+        "https://example.test/pending.zip",
+        task_id="task-restart-pending",
+        auto_classify=True,
+        skip_archive=True,
+    )
+
+    await engine.submit(task)
+    engine.stop()
+
+    db = TestingSessionLocal()
+    try:
+        row = db.query(TaskRecord).filter(TaskRecord.id == task.id).one_or_none()
+        assert row is not None
+        assert row.status == TaskStatus.PENDING.value
+    finally:
+        db.close()
+
+    restarted = TaskEngine()
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(restarted, "_worker", wait_forever)
+    monkeypatch.setattr(restarted, "_retry_scheduler", wait_forever)
+    restarted.start()
+    try:
+        restored = restarted.get_task(task.id)
+        assert restored is not None
+        assert restored.status == TaskStatus.PENDING
+        assert restored.auto_classify is True
+        assert restored.skip_archive is True
+        assert restarted.queue.qsize() == 1
+        assert restarted.load_persisted_queue_tasks() == 0
+        assert restarted.queue.qsize() == 1
+
+        service = TaskCenterService()
+        monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: restarted)
+        _use_empty_non_engine_task_sources(monkeypatch, service)
+        listed = await service.list_items(mode="summary", limit=10)
+        assert listed["total"] == 1
+        assert listed["items"][0]["engine_task_id"] == task.id
+        assert listed["items"][0]["status"] == TaskStatus.PENDING.value
+    finally:
+        restarted.stop()
+        await asyncio.gather(
+            restarted._worker_task,
+            restarted._retry_scheduler_task,
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persisted_status", "expected_status", "expected_queued"),
+    [
+        (TaskStatus.PROCESSING, TaskStatus.PENDING, 1),
+        (TaskStatus.PAUSED, TaskStatus.PAUSED, 0),
+        (TaskStatus.WAITING_RETRY, TaskStatus.WAITING_RETRY, 0),
+        (TaskStatus.WAITING_MANUAL, TaskStatus.WAITING_MANUAL, 0),
+        (TaskStatus.FAILED, TaskStatus.FAILED, 0),
+        (TaskStatus.COMPLETED, TaskStatus.COMPLETED, 0),
+    ],
+)
+async def test_restart_restore_respects_task_status(
+    monkeypatch,
+    persisted_status,
+    expected_status,
+    expected_queued,
+):
+    """只有待处理或被中断的处理中任务可以自动重新入队。"""
+    _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    task = Task(
+        TaskType.AUTO_PROCESS,
+        f"/tmp/{persisted_status.value}.zip",
+        task_id=f"task-restart-{persisted_status.value}",
+    )
+    await engine.submit(task)
+    with task._set_state_silent():
+        task.status = persisted_status
+        if persisted_status == TaskStatus.PROCESSING:
+            task.started_at = datetime.now()
+        if persisted_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            task.completed_at = datetime.now()
+    task.mark_changed("status")
+    engine.stop()
+
+    restarted = TaskEngine()
+    try:
+        assert restarted.load_persisted_queue_tasks() == 1
+        restored = restarted.get_task(task.id)
+        assert restored.status == expected_status
+        assert restarted.queue.qsize() == expected_queued
+    finally:
+        restarted.stop()
+
+
+def test_restart_restore_does_not_execute_legacy_unmarked_pending_task(monkeypatch):
+    """历史 pending 快照只允许保留，升级后不能突然自动执行。"""
+    TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    db = TestingSessionLocal()
+    try:
+        db.add(TaskRecord(
+            id="task-legacy-unmarked-pending",
+            type=TaskType.EXTRACT.value,
+            status=TaskStatus.PENDING.value,
+            source_path="/tmp/legacy.zip",
+            task_metadata={},
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    engine = TaskEngine()
+    try:
+        assert engine.load_persisted_queue_tasks() == 0
+        assert engine.get_task("task-legacy-unmarked-pending") is None
+        assert engine.queue.qsize() == 0
+    finally:
+        engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_requeues_stale_processing_snapshot_marked_for_restore(monkeypatch):
+    """启动清理与通用恢复必须串联，中断任务不能被留在等待重试状态。"""
+    _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    _stub_task_engine_side_effects(monkeypatch, engine)
+    task = Task(
+        TaskType.AUTO_PROCESS,
+        "/tmp/stale-processing-restart.zip",
+        task_id="task-restart-stale-processing",
+    )
+    await engine.submit(task)
+    with task._set_state_silent():
+        task.status = TaskStatus.PROCESSING
+        task.started_at = datetime.now() - timedelta(hours=1)
+    task.mark_changed("status")
+    engine.stop()
+
+    restarted = TaskEngine()
+    restarted.stale_processing_seconds = 60
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(restarted, "_worker", wait_forever)
+    monkeypatch.setattr(restarted, "_retry_scheduler", wait_forever)
+    restarted.start()
+    try:
+        restored = restarted.get_task(task.id)
+        assert restored.status == TaskStatus.PENDING
+        assert restored.task_metadata["stale_processing_recovered"] is True
+        assert restarted.queue.qsize() == 1
+    finally:
+        restarted.stop()
+        await asyncio.gather(
+            restarted._worker_task,
+            restarted._retry_scheduler_task,
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    [
+        ("pause", TaskStatus.PAUSED),
+        ("cancel", TaskStatus.CANCELLED),
+    ],
+)
+async def test_restart_after_pause_or_cancel_does_not_requeue_task(
+    monkeypatch,
+    action,
+    expected_status,
+):
+    """正常停止必须排空最后一次状态快照，不能复活旧的 pending 记录。"""
+    TestingSessionLocal = _use_isolated_task_database(monkeypatch)
+    engine = TaskEngine()
+    _stub_task_engine_side_effects(monkeypatch, engine)
+    task = Task(
+        TaskType.AUTO_PROCESS,
+        f"/tmp/{action}-before-restart.zip",
+        task_id=f"task-restart-after-{action}",
+    )
+    await engine.submit(task)
+
+    if action == "pause":
+        engine.pause_task(task.id)
+    else:
+        engine.cancel_task(task.id)
+    engine.stop()
+
+    db = TestingSessionLocal()
+    try:
+        row = db.query(TaskRecord).filter(TaskRecord.id == task.id).one()
+        assert row.status == expected_status.value
+    finally:
+        db.close()
+
+    restarted = TaskEngine()
+    try:
+        assert restarted.load_persisted_queue_tasks() == 1
+        restored = restarted.get_task(task.id)
+        assert restored.status == expected_status
+        assert restarted.queue.qsize() == 0
+        if action == "pause":
+            restarted.resume_task(task.id)
+            assert restored.status == TaskStatus.PENDING
+            assert restarted.queue.qsize() == 1
+            restarted.stop()
+            db = TestingSessionLocal()
+            try:
+                row = db.query(TaskRecord).filter(TaskRecord.id == task.id).one()
+                assert row.status == TaskStatus.PENDING.value
+            finally:
+                db.close()
+    finally:
+        restarted.stop()
 
 
 @pytest.mark.asyncio

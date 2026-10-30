@@ -563,6 +563,10 @@ class TaskEngine:
         TaskStatus.WAITING_MANUAL.value,
         TaskStatus.WAITING_RETRY.value,
     }
+    _QUEUE_RESTORE_VERSION = 1
+    _QUEUE_RESTORE_VERSION_KEY = "queue_restore_version"
+    _QUEUE_RESTORE_OPTIONS_KEY = "queue_restore_options"
+
     def __init__(
         self,
         max_concurrent: int = 2,
@@ -642,7 +646,12 @@ class TaskEngine:
     def _is_terminal_or_waiting_status(cls, task: Task) -> bool:
         return cls._status_value(task) in cls._TERMINAL_OR_WAITING_STATUSES
 
-    def _emit_task_center_event(self, task: Task, reason: str = "progress") -> None:
+    def _emit_task_center_event(
+        self,
+        task: Task,
+        reason: str = "progress",
+        schedule_snapshot: bool = True,
+    ) -> None:
         # 全局 hook 也会收到仅供内部服务传递进度的临时 Task。只有已经正式
         # 注册进任务引擎的任务才允许写 Redis / 任务中心，否则临时元数据、
         # 解压和过滤任务会被永久物化成 pending/system 孤儿记录。
@@ -655,6 +664,8 @@ class TaskEngine:
             self._bump_task_center_version()
             self._write_task_runtime_to_redis(task, reason=reason)
             self.enqueue_task_center_item_snapshot(task)
+            if schedule_snapshot and reason != "progress":
+                self._schedule_task_snapshot_persistence(task)
             broadcast_task_center_changed(task, reason=reason)
         except Exception:
             logger.debug("任务中心事件广播失败: task_id=%s", getattr(task, "id", ""), exc_info=True)
@@ -929,12 +940,44 @@ class TaskEngine:
             except Exception as e:
                 logger.error(f"进度回调错误: {e}")
     
+    @classmethod
+    def _is_restart_restorable_task(cls, task: Task) -> bool:
+        metadata = task.task_metadata if isinstance(task.task_metadata, dict) else {}
+        try:
+            return int(metadata.get(cls._QUEUE_RESTORE_VERSION_KEY) or 0) == cls._QUEUE_RESTORE_VERSION
+        except (TypeError, ValueError):
+            return False
+
+    def _mark_task_for_restart_restore(self, task: Task) -> None:
+        metadata = dict(task.task_metadata or {})
+        metadata[self._QUEUE_RESTORE_VERSION_KEY] = self._QUEUE_RESTORE_VERSION
+        metadata[self._QUEUE_RESTORE_OPTIONS_KEY] = {
+            "auto_classify": bool(task.auto_classify),
+            "skip_archive": bool(task.skip_archive),
+            "rjcode": str(task.rjcode or ""),
+        }
+        task.task_metadata = metadata
+
+    def _schedule_task_snapshot_persistence(self, task: Task) -> None:
+        """串行保存可恢复任务的状态变更，避免同步数据库写入阻塞事件循环。"""
+        if self._shutdown or not self._is_restart_restorable_task(task):
+            return
+        # 非进度事件必须立即落库；否则暂停后快速重启会被旧的 pending 快照复活。
+        self._persisted_task_snapshot_last_write_at[task.id] = 0.0
+        try:
+            self._materialized_snapshot_executor.submit(self.persist_task_snapshot, task)
+        except RuntimeError:
+            logger.debug("[任务持久化] 快照执行器已关闭: task_id=%s", task.id, exc_info=True)
+
     async def submit(self, task: Task) -> str:
         """提交任务"""
+        self._mark_task_for_restart_restore(task)
         self._ensure_task_context(task)
         self.tasks[task.id] = task
+        # 先入持久化快照再入执行队列；崩溃恢复时至少有明确的 pending 状态。
+        await asyncio.to_thread(self.persist_task_snapshot, task)
         await self.queue.put(task)
-        task.mark_changed("submitted")
+        self._emit_task_center_event(task, reason="submitted", schedule_snapshot=False)
         rjcode = self._extract_rjcode_from_path_tail(task.source_path) or "未知"
         source_path = str(task.source_path or "").rstrip("\\/")
         source_name = re.split(r"[\\/]+", source_path)[-1].strip() if source_path else ""
@@ -1345,6 +1388,91 @@ class TaskEngine:
             if normalized in {item.value, item.name}:
                 return item
         return TaskStatus.COMPLETED
+
+    def load_persisted_queue_tasks(self) -> int:
+        """恢复本版本明确标记的通用任务；历史无标记快照绝不自动执行。"""
+        from ..models.database import SessionLocal, Task as TaskRecord
+
+        db = SessionLocal()
+        loaded_count = 0
+        queued_count = 0
+        try:
+            rows = db.query(TaskRecord).order_by(TaskRecord.created_at.asc()).all()
+            for row in rows:
+                if row.id in self.tasks:
+                    continue
+                metadata = dict(row.task_metadata or {})
+                try:
+                    restore_version = int(metadata.get(self._QUEUE_RESTORE_VERSION_KEY) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if restore_version != self._QUEUE_RESTORE_VERSION:
+                    continue
+
+                task_type = self._coerce_task_type(row.type)
+                if task_type is None:
+                    logger.warning("[任务持久化] 跳过未知类型任务: task_id=%s type=%s", row.id, row.type)
+                    continue
+                restored_status = self._coerce_task_status(row.status)
+                options = metadata.get(self._QUEUE_RESTORE_OPTIONS_KEY)
+                if not isinstance(options, dict):
+                    options = {}
+                task = Task(
+                    task_type=task_type,
+                    source_path=row.source_path or str(metadata.get("source_path") or ""),
+                    output_path=row.output_path,
+                    auto_classify=bool(options.get("auto_classify", metadata.get("auto_classify", False))),
+                    skip_archive=bool(options.get("skip_archive", metadata.get("skip_archive", False))),
+                    metadata=metadata,
+                    task_id=row.id,
+                    status=restored_status,
+                    rjcode=options.get("rjcode") or metadata.get("rjcode") or metadata.get("target_rjcode") or "",
+                )
+                with task._set_state_silent():
+                    task.progress = int(row.progress or 0)
+                    task.current_step = row.current_step or "等待中"
+                    task.error_message = row.error_message
+                    task.created_at = row.created_at or task.created_at
+                    task.started_at = row.started_at
+                    task.completed_at = row.completed_at
+                self._ensure_task_context(task)
+                self.tasks[task.id] = task
+
+                interrupted_processing_retry = (
+                    restored_status == TaskStatus.WAITING_RETRY
+                    and bool(metadata.get("stale_processing_recovered"))
+                )
+                should_requeue = restored_status in {TaskStatus.PENDING, TaskStatus.PROCESSING} or interrupted_processing_retry
+                if should_requeue:
+                    previous_status = restored_status.value
+                    metadata = dict(task.task_metadata or {})
+                    metadata["restart_recovered_from_status"] = previous_status
+                    metadata["restart_recovered_at"] = datetime.now().isoformat()
+                    task.task_metadata = metadata
+                    with task._set_state_silent():
+                        task.status = TaskStatus.PENDING
+                        task.current_step = "等待重启后继续"
+                        task.error_message = None
+                        task.started_at = None
+                        task.completed_at = None
+                        task._pause_event.set()
+                    self.queue.put_nowait(task)
+                    queued_count += 1
+                    task.mark_changed("restart_recovered")
+                loaded_count += 1
+
+            if loaded_count:
+                logger.info(
+                    "[任务持久化] 已恢复通用任务 %s 个，其中 %s 个重新入队",
+                    loaded_count,
+                    queued_count,
+                )
+            return loaded_count
+        except Exception:
+            logger.warning("[任务持久化] 恢复通用任务队列失败", exc_info=True)
+            return loaded_count
+        finally:
+            db.close()
 
     def load_persisted_linked_subtitle_tasks(self) -> int:
         """恢复字幕补配工作台任务，只有用户清理后才从工作台消失。"""
@@ -4061,6 +4189,10 @@ class TaskEngine:
             except Exception:
                 logger.warning("[任务清理] 完成问题作品处理链路失败: task_id=%s", task.id, exc_info=True)
             try:
+                await asyncio.to_thread(self._finalize_reprocessed_archive, task)
+            except Exception:
+                logger.warning("[任务清理] 同步重新处理归档状态失败: task_id=%s", task.id, exc_info=True)
+            try:
                 await self._cleanup_task_temp_extract_path(task)
             except Exception:
                 logger.warning("[任务清理] 清理临时解压目录失败: task_id=%s", task.id, exc_info=True)
@@ -4082,7 +4214,7 @@ class TaskEngine:
             try:
                 snapshot_writer = (
                     self.persist_task_snapshot
-                    if task.type == TaskType.AI_TITLE_TRANSLATION
+                    if task.type == TaskType.AI_TITLE_TRANSLATION or self._is_restart_restorable_task(task)
                     else self.persist_task_center_item_snapshot
                 )
                 await asyncio.to_thread(snapshot_writer, task)
@@ -4119,6 +4251,13 @@ class TaskEngine:
     
     def start(self):
         """启动引擎"""
+        # 先完成数据库水合，再启动 worker，避免恢复过程中提前执行队列项。
+        self.recover_stale_processing_tasks()
+        self.load_waiting_retry_tasks()
+        self.load_persisted_linked_subtitle_tasks()
+        self.load_persisted_ai_title_tasks()
+        self.load_persisted_queue_tasks()
+
         if not self._worker_task:
             self._worker_task = asyncio.create_task(self._worker())
             logger.info("任务引擎已启动")
@@ -4127,12 +4266,6 @@ class TaskEngine:
         if not self._retry_scheduler_task:
             self._retry_scheduler_task = asyncio.create_task(self._retry_scheduler())
             logger.info("重试调度器已启动")
-
-        # 加载等待重试的任务
-        self.recover_stale_processing_tasks()
-        self.load_waiting_retry_tasks()
-        self.load_persisted_linked_subtitle_tasks()
-        self.load_persisted_ai_title_tasks()
 
     async def _retry_scheduler(self):
         """定时重试调度器，使用cron表达式"""
@@ -4366,7 +4499,8 @@ class TaskEngine:
             self._worker_task.cancel()
         if self._retry_scheduler_task:
             self._retry_scheduler_task.cancel()
-        self._materialized_snapshot_executor.shutdown(wait=False, cancel_futures=True)
+        # 等待已排队的任务快照写完，避免正常重启丢掉最后一次状态变更。
+        self._materialized_snapshot_executor.shutdown(wait=True, cancel_futures=False)
 
     def retry_task(self, task_id: str):
         """手动重试等待中的任务"""
@@ -5471,6 +5605,46 @@ class TaskEngine:
             except (FileNotFoundError, PermissionError, OSError) as exc:
                 logger.debug(f"清理空父目录停止: {current}, {exc}")
                 break
+
+    def _finalize_reprocessed_archive(self, task: Task) -> None:
+        """在重新处理任务终态同步其归档记录，不重复累计处理次数。"""
+        if not task.skip_archive:
+            return
+        archive_status = {
+            TaskStatus.COMPLETED: "completed",
+            TaskStatus.FAILED: "failed",
+            TaskStatus.CANCELLED: "failed",
+        }.get(task.status)
+        if not archive_status:
+            return
+
+        from ..models.database import ProcessedArchive, get_db
+
+        db = next(get_db())
+        try:
+            archive = db.query(ProcessedArchive).filter(
+                ProcessedArchive.task_id == task.id,
+                ProcessedArchive.status == "reprocessing",
+            ).first()
+            if not archive:
+                return
+            archive.status = archive_status
+            archive.processed_at = datetime.now()
+            db.commit()
+            try:
+                from .task_center_event_service import broadcast_processed_archive_changed
+
+                broadcast_processed_archive_changed(archive)
+            except Exception:
+                logger.debug("广播重新处理归档更新事件失败", exc_info=True)
+            logger.info(
+                "重新处理归档状态已同步: task_id=%s archive_id=%s status=%s",
+                task.id,
+                archive.id,
+                archive_status,
+            )
+        finally:
+            db.close()
 
     async def _archive_source_file(self, task: Task):
         """将业务完成后的源压缩包加入低优先级、可恢复的归档队列。

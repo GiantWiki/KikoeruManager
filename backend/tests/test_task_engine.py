@@ -63,9 +63,13 @@ class TestTaskEngine:
     """测试任务引擎"""
     
     @pytest.fixture
-    def engine(self):
-        """创建任务引擎实例"""
-        return TaskEngine(max_concurrent=2)
+    def engine(self, monkeypatch):
+        """创建任务引擎实例，普通单元测试不访问外部数据库。"""
+        engine = TaskEngine(max_concurrent=2)
+        monkeypatch.setattr(engine, "persist_task_snapshot", Mock())
+        monkeypatch.setattr(engine, "persist_task_center_item_snapshot", Mock())
+        monkeypatch.setattr(engine, "enqueue_task_center_item_snapshot", Mock())
+        return engine
     
     @pytest.fixture
     def sample_task(self):
@@ -534,6 +538,7 @@ class TestTaskEngine:
         assert sample_task.id == task_id
         assert len(engine.tasks) == 1
         assert engine.tasks[task_id] == sample_task
+        engine.persist_task_snapshot.assert_called_once_with(sample_task)
 
     @pytest.mark.asyncio
     async def test_submit_auto_process_file_does_not_start_background_precheck(self, engine, sample_task, tmp_path, monkeypatch):

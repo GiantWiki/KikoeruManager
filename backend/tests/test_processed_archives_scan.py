@@ -2,13 +2,14 @@ import asyncio
 import os
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
 
 from app.api import routes as routes_module
 from app.config import settings as settings_module
-from app.core.task_engine import Task, TaskStatus, TaskType
+from app.core.task_engine import Task, TaskEngine, TaskStatus, TaskType
 from app.models import database as database_module
 from app.models.database import ProcessedArchive
 
@@ -309,6 +310,103 @@ def _patch_reprocess_dependencies(monkeypatch, archive, engine):
         lambda: SimpleNamespace(watcher=SimpleNamespace(auto_classify=True)),
     )
     return db
+
+
+@pytest.mark.asyncio
+async def test_reprocessed_archive_status_follows_task_completion(tmp_path, monkeypatch):
+    archive_path = tmp_path / "RJ00012345.zip"
+    archive_path.write_bytes(b"payload")
+    task = Task(
+        task_type=TaskType.CIRCLE_COMPLETION_DOWNLOAD_BATCH,
+        task_id="reprocess-task",
+        source_path=str(archive_path),
+        skip_archive=True,
+        rjcode="RJ00012345",
+    )
+    archive = _reprocess_archive_record(
+        archive_path,
+        status="reprocessing",
+        task_id=task.id,
+    )
+    archive.process_count = 2
+    engine = TaskEngine()
+    db = _patch_reprocess_dependencies(monkeypatch, archive, engine)
+    monkeypatch.setattr(engine, "_notify_progress", AsyncMock())
+    monkeypatch.setattr(engine, "_resolve_retry_extract_conflict", Mock())
+    monkeypatch.setattr(engine, "_resolve_completed_failure_followups", Mock())
+    monkeypatch.setattr(engine, "_finalize_conflict_resolution_task", Mock())
+    monkeypatch.setattr(engine, "_cleanup_task_temp_extract_path", AsyncMock())
+    monkeypatch.setattr(engine, "_cleanup_failed_task", AsyncMock())
+    monkeypatch.setattr(engine, "persist_task_snapshot", Mock())
+    monkeypatch.setattr(engine, "persist_task_center_item_snapshot", Mock())
+    monkeypatch.setattr("app.core.activity_log_service.log_task_lifecycle_event", Mock())
+    monkeypatch.setattr("app.core.task_notification_service.enqueue_notification_check", AsyncMock())
+    broadcast_archive_changed = Mock()
+    monkeypatch.setattr(
+        "app.core.task_center_event_service.broadcast_processed_archive_changed",
+        broadcast_archive_changed,
+    )
+
+    await engine._process_task(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    assert archive.status == "completed"
+    assert archive.process_count == 2
+    assert db.commit_count == 1
+    assert db.closed is True
+    broadcast_archive_changed.assert_called_once_with(archive)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", [TaskStatus.FAILED, TaskStatus.CANCELLED])
+async def test_reprocessed_archive_status_follows_task_failure(tmp_path, monkeypatch, terminal_status):
+    archive_path = tmp_path / "RJ00012345.zip"
+    archive_path.write_bytes(b"payload")
+    task = Task(
+        task_type=TaskType.AUTO_PROCESS,
+        task_id="reprocess-terminal-task",
+        source_path=str(archive_path),
+        skip_archive=True,
+        status=terminal_status,
+    )
+    archive = _reprocess_archive_record(
+        archive_path,
+        status="reprocessing",
+        task_id=task.id,
+    )
+    engine = TaskEngine()
+    db = _patch_reprocess_dependencies(monkeypatch, archive, engine)
+
+    engine._finalize_reprocessed_archive(task)
+
+    assert archive.status == "failed"
+    assert db.commit_count == 1
+    assert db.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_status", [TaskStatus.WAITING_RETRY, TaskStatus.WAITING_MANUAL])
+async def test_reprocessed_archive_status_waits_for_terminal_task(tmp_path, monkeypatch, active_status):
+    task = Task(
+        task_type=TaskType.AUTO_PROCESS,
+        task_id="reprocess-active-task",
+        source_path=str(tmp_path / "RJ00012345.zip"),
+        skip_archive=True,
+        status=active_status,
+    )
+    archive = _reprocess_archive_record(
+        tmp_path / "RJ00012345.zip",
+        status="reprocessing",
+        task_id=task.id,
+    )
+    engine = TaskEngine()
+    db = _patch_reprocess_dependencies(monkeypatch, archive, engine)
+
+    engine._finalize_reprocessed_archive(task)
+
+    assert archive.status == "reprocessing"
+    assert db.commit_count == 0
+    assert db.closed is False
 
 
 @pytest.mark.asyncio
