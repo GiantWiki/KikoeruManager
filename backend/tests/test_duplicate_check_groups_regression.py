@@ -79,6 +79,9 @@ class _FakeExpr:
     def label(self, name):
         return _FakeExpr(f"{self.tag}:{name}")
 
+    def over(self):
+        return _FakeExpr(f"{self.tag}:over")
+
     def desc(self):
         return self
 

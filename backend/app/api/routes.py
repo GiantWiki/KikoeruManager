@@ -23820,6 +23820,17 @@ async def get_duplicate_groups(
     - 输入库（storage.input_path）内部的多个版本折叠为一个版本：
       输入库是待处理区，内部自重复（如压缩包与解压残留并存）没有清理价值。
     """
+    return await asyncio.to_thread(
+        _get_duplicate_groups_page,
+        page=page,
+        page_size=page_size,
+        sort=sort,
+        search=search,
+    )
+
+
+def _get_duplicate_groups_page(page: int, page_size: int, sort: str, search: str):
+    """在线程中执行同步查询，避免拖住 FastAPI 主事件循环。"""
     from ..models.database import LibraryIndexEntry, get_db
 
     db = next(get_db())
@@ -23879,6 +23890,7 @@ async def get_duplicate_groups(
         base_q = (
             db.query(
                 LibraryIndexEntry.rjcode,
+                func.count().over().label("total_count"),
                 func.count(func.distinct(version_key_expr)).label("version_count"),
                 func.count(func.distinct(LibraryIndexEntry.library_id)).label("library_count"),
                 func.coalesce(func.sum(file_count_value), 0).label("file_count"),
@@ -23915,9 +23927,6 @@ async def get_duplicate_groups(
             func.count(func.distinct(version_key_expr)) > 1
         )
 
-        count_q = base_q.subquery()
-        total = db.query(func.count()).select_from(count_q).scalar() or 0
-
         sort_map = {
             "version_count": func.count(func.distinct(version_key_expr)).desc(),
             "total_size": func.coalesce(func.sum(size_value), 0).desc(),
@@ -23932,6 +23941,13 @@ async def get_duplicate_groups(
             .limit(page_size)
             .all()
         )
+        if rows:
+            total = int(rows[0].total_count)
+        elif page > 1:
+            # 空越界页没有窗口行可携带总数，保留原 count 语义。
+            total = db.query(func.count()).select_from(base_q.subquery()).scalar() or 0
+        else:
+            total = 0
 
         groups = []
         for row in rows:
