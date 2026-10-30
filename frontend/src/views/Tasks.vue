@@ -153,6 +153,7 @@ const domainOptions = [
   { value: 'existing_folder', label: '已有文件夹', icon: FolderInput },
   { value: 'rj_subtitle', label: 'RJ 字幕', icon: Captions },
   { value: 'subtitle_import', label: '字幕补配', icon: Sparkles },
+  { value: 'ai_title', label: 'AI 标题汉化', icon: Sparkles },
   { value: 'asmr_sync', label: 'ASMR 同步', icon: UploadCloud },
   { value: 'http_download', label: 'HTTP 下载', icon: Download },
   { value: 'baidu_netdisk', label: '百度网盘', icon: CloudDownload },
@@ -1562,10 +1563,28 @@ async function handleTaskAction(item, action) {
       return
     }
   }
+  if (action === 'rollback_ai_title') {
+    try {
+      await showSystemConfirm({
+        title: '回退 AI 汉化修改',
+        message: `确认回退「${item?.title || '该任务'}」已产生的 AI 汉化修改？`,
+        description: '将按任务快照恢复 AI 标题、内部文件名和项目目录；不会覆盖后续手工修改，同名冲突项会跳过。',
+        tone: 'warning',
+        confirmText: '确认回退',
+        cancelText: '取消',
+      })
+    } catch (_) {
+      return
+    }
+  }
   try {
     const result = await taskCenterApi.action(item.id, action)
     if (result?.route_hint) await router.push(result.route_hint)
-    ElMessage.success(result?.message || '操作成功')
+    if (result?.partial || result?.success === false) {
+      ElMessage.warning(result?.message || '部分项目未能回退')
+    } else {
+      ElMessage.success(result?.message || '操作成功')
+    }
     await refreshTaskCenter()
   } catch (error) {
     console.error('执行任务动作失败:', error)
@@ -1573,32 +1592,86 @@ async function handleTaskAction(item, action) {
   }
 }
 
-async function handleRestoreFilteredItem({ entry }) {
+async function handleRestoreFilteredItem(payload = {}) {
   const item = selectedItem.value
-  const recoveryId = String(entry?.recoveryId || '').trim()
-  const recoveryRelativePath = String(entry?.recoveryRelativePath || '').trim()
-  const recoveryKey = String(entry?.recoveryKey || recoveryId).trim()
-  if (!item || !recoveryId) return
-  const isDirectory = entry?.type === 'dir'
+  const sourceEntries = Array.isArray(payload.entries) && payload.entries.length
+    ? payload.entries
+    : (payload.entry ? [payload.entry] : [])
+  const candidates = []
+  const seen = new Set()
+  for (const entry of sourceEntries) {
+    const recoveryId = String(entry?.recoveryId || '').trim()
+    const recoveryKey = String(entry?.recoveryKey || recoveryId).trim()
+    if (!recoveryId || seen.has(recoveryKey)) continue
+    seen.add(recoveryKey)
+    candidates.push({
+      entry,
+      recoveryId,
+      recoveryKey,
+      recoveryRelativePath: String(entry?.recoveryRelativePath || '').trim(),
+    })
+  }
+  if (!item || !candidates.length) return
+  const isBatch = candidates.length > 1
+  const isDirectory = !isBatch && candidates[0].entry?.type === 'dir'
   try {
     await showSystemConfirm({
-      title: isDirectory ? '还原过滤目录' : '还原过滤文件',
-      message: `确认把「${entry.label || '该过滤项'}」还原到最终入库位置？`,
-      description: '目标存在同名内容时会停止还原，不会覆盖现有库存。',
+      title: isBatch ? '批量还原已删除内容' : (isDirectory ? '还原已删除目录' : '还原已删除文件'),
+      message: isBatch
+        ? `确认把选中的 ${candidates.length} 项内容还原到最终入库位置？`
+        : `确认把「${candidates[0].entry.label || '该已删除项'}」还原到最终入库位置？`,
+      description: '目标存在同名内容时不会覆盖现有库存；批量还原会记录失败项并继续处理其余内容。',
       confirmText: '还原',
     })
   } catch (_) {
     return
   }
+
+  const failures = []
+  let successCount = 0
+  let singleResult = null
+  restoringRecoveryId.value = isBatch ? 'batch' : candidates[0].recoveryKey
   try {
-    restoringRecoveryId.value = recoveryKey
-    const result = await taskCenterApi.restoreFilteredItem(item.id, recoveryId, recoveryRelativePath)
-    ElMessage.success(result?.message || '过滤项已还原')
-    await fetchSelectedItemDetail(item.id, { force: true })
-    await refreshTaskCenter(false, { silent: true })
-  } catch (error) {
-    console.error('还原过滤项失败:', error)
-    ElMessage.error('还原失败: ' + (error.response?.data?.detail || error.message))
+    for (const candidate of candidates) {
+      try {
+        const result = await taskCenterApi.restoreFilteredItem(
+          item.id,
+          candidate.recoveryId,
+          candidate.recoveryRelativePath,
+        )
+        successCount += 1
+        singleResult = result
+      } catch (error) {
+        console.error('还原过滤项失败:', error)
+        failures.push({
+          label: candidate.entry?.label || candidate.recoveryKey,
+          message: error.response?.data?.detail || error.message || String(error),
+        })
+      }
+    }
+
+    if (isBatch) {
+      const failureText = failures.slice(0, 3)
+        .map(failure => `${failure.label}（${failure.message}）`)
+        .join('；')
+      const remainingText = failures.length > 3 ? `；另有 ${failures.length - 3} 项失败` : ''
+      if (!successCount) {
+        ElMessage.error(`批量还原失败：${failureText}${remainingText}`)
+      } else if (failures.length) {
+        ElMessage.warning(`已还原 ${successCount} 项，${failures.length} 项失败：${failureText}${remainingText}`)
+      } else {
+        ElMessage.success(`已还原 ${successCount} 项到库存`)
+      }
+    } else if (failures.length) {
+      ElMessage.error(`还原失败: ${failures[0].message}`)
+    } else {
+      ElMessage.success(singleResult?.message || '已还原到库存')
+    }
+
+    if (successCount) {
+      await fetchSelectedItemDetail(item.id, { force: true })
+      await refreshTaskCenter(false, { silent: true })
+    }
   } finally {
     restoringRecoveryId.value = ''
   }
@@ -1620,7 +1693,7 @@ function taskTreeRowRelativePath(entry, section) {
 function buildTaskLibraryDeleteMessage(preview) {
   const targetLabel = preview?.type === 'folder' ? '文件夹' : '文件'
   const sizeText = Number(preview?.size) > 0 ? `\n大小: ${formatBytes(Number(preview.size))}` : ''
-  return `确定删除此${targetLabel}吗？\n名称: ${preview?.name || '-'}${sizeText}\n\n此操作不可恢复！`
+  return `确定删除此${targetLabel}吗？\n名称: ${preview?.name || '-'}${sizeText}\n\n内容将移入本任务的恢复区，可在文件树中右键还原；恢复区被清理后将无法恢复。`
 }
 
 async function handleDeleteLibraryEntry({ entry, section }) {
@@ -1636,9 +1709,11 @@ async function handleDeleteLibraryEntry({ entry, section }) {
     return
   }
   const relative = taskTreeRowRelativePath(entry, section)
-  const absolutePath = relative
-    ? `${String(outputRoot).replace(/[\\/]+$/, '')}/${relative}`
-    : String(outputRoot)
+  if (!relative) {
+    ElMessage.warning('为避免整项误删，请选择作品内部的文件或子目录')
+    return
+  }
+  const absolutePath = `${String(outputRoot).replace(/[\\/]+$/, '')}/${relative}`
   const metadata = item?.details?.metadata || {}
   const libraryId = String(metadata.target_library_id || '').trim() || null
   try {
@@ -1650,8 +1725,8 @@ async function handleDeleteLibraryEntry({ entry, section }) {
       confirmText: '确定删除',
       cancelText: '取消',
     })
-    await libraryApi.browserDelete(libraryId, absolutePath, true)
-    ElMessage.success('删除成功')
+    const result = await taskCenterApi.deleteLibraryItem(item.id, relative, libraryId)
+    ElMessage.success(result?.message || '已移入恢复区')
     await fetchSelectedItemDetail(item.id, { force: true, silent: true })
     await refreshTaskCenter(false, { silent: true })
   } catch (error) {

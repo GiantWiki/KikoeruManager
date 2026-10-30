@@ -389,8 +389,10 @@ import {
   httpDownloadPlatformsFromUrl,
 } from '../common/httpDownloadPlatformMeta.js'
 import {
+  baiduInputLineMatchesStartedItem,
   extractBaiduShareUrls,
   isPikPakPassCodeLine,
+  normalizeBaiduStructuredLine,
   normalizeHttpDownloadInputRows,
   pikPakShareIdentity,
 } from './httpDownloadInput.js'
@@ -628,25 +630,6 @@ function normalizeBaiduInputRows(rows) {
   return extractBaiduShareUrls((rows || []).map(normalizeBaiduStructuredLine))
 }
 
-// 规范格式（RJ | 链接 | 提取码: x | 解压码: y）先切段，只把干净链接 + 提取码交给旧解析，
-// 否则「无 pwd 链接 + 解压码段」会被裸串兜底当成 ?pwd=解压码。
-const BAIDU_STRUCTURED_SEPARATOR_RE = /\s*[|｜]\s*|\t+|\s+-{3,}\s+/
-const BAIDU_PASS_CODE_LABEL_RE = /^(?:提取码|提取口令|访问码|pwd|passcode|pass_code)\s*[:：=]/i
-
-function normalizeBaiduStructuredLine(value) {
-  const text = String(value || '').trim()
-  if (!text || !/[|｜\t]/.test(text)) return text
-  const segments = text.split(BAIDU_STRUCTURED_SEPARATOR_RE).map(item => item.trim()).filter(Boolean)
-  if (segments.length < 2) return text
-  const urlSegment = segments.find(item => isBaiduShareUrl(item))
-  if (!urlSegment) return text
-  const passSegment = segments.find(item => BAIDU_PASS_CODE_LABEL_RE.test(item))
-  const code = passSegment
-    ? baiduPassCodeFromText(passSegment.replace(/^[^:：=]*[:：=]\s*/, ''))
-    : ''
-  return code ? appendBaiduPassCode(urlSegment, code) : urlSegment
-}
-
 function normalizeBaiduShareLine(value) {
   const text = String(value || '').trim()
   if (!text) return ''
@@ -715,7 +698,8 @@ function baiduShareIdentity(value) {
 
 function isBaiduPassCodeLine(value) {
   const text = String(value || '').trim()
-  return Boolean(text && !isBaiduShareUrl(text) && baiduPassCodeFromText(text))
+  if (!text || isBaiduShareUrl(text)) return false
+  return /^(?:(?:提取码|提取口令|访问码|密码|密碼|pwd|passcode|pass_code|code)\s*[:：=]?\s*)?[A-Za-z0-9]{2,32}$/i.test(text)
 }
 
 function attachInputUrlToPreviewItems(items, inputUrl) {
@@ -743,10 +727,7 @@ function inputLineMatchesStartedItem(line, item) {
   const trimmed = String(line || '').trim()
   if (!trimmed || !item) return false
   if (isBaidu.value) {
-    if (!isBaiduShareUrl(normalizeBaiduShareLine(trimmed))) return false
-    const lineIdentity = baiduShareIdentity(normalizeBaiduShareLine(trimmed))
-    const itemIdentity = baiduShareIdentity(item.share_url || item.url || item.masked_url || '')
-    return Boolean(lineIdentity && itemIdentity && lineIdentity === itemIdentity)
+    return baiduInputLineMatchesStartedItem(trimmed, item)
   }
   const itemSource = sourceKey(item.source || item.download_mode || sourceFromUrl(item._input_url || item.url || item.masked_url || ''))
   if (itemSource === 'pikpak') {

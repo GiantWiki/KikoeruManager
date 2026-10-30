@@ -294,6 +294,17 @@
                 <component :is="option.icon" :size="12" :stroke-width="2.4" class="task-tree-filter-button__icon" />
                 <span>{{ option.label }}</span>
               </button>
+              <button
+                v-if="selectedRecoveryEntries.length"
+                type="button"
+                class="task-tree-toggle task-tree-restore-selected"
+                :disabled="!!restoringRecoveryId"
+                @click="restoreCheckedEntries"
+              >
+                <RefreshCw v-if="restoringRecoveryId === 'batch'" :size="12" class="animate-spin" />
+                <RotateCcw v-else :size="12" :stroke-width="2.4" />
+                <span>{{ restoringRecoveryId === 'batch' ? '正在批量还原...' : `还原所选（${selectedRecoveryEntries.length}）` }}</span>
+              </button>
             </div>
           </div>
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -342,11 +353,22 @@
               :class="{
                 'tree-row-filtered': entry.status === 'removed',
                 'tree-row-restored': entry.status === 'restored',
+                'tree-row-recovery-selected': isRecoveryEntrySelected(entry),
               }"
 :style="{ height: `${virtualRow.size}px`, transform: `translateY(${virtualRow.start}px)`, paddingLeft: `${entry.depth * 16 + 8}px` }"
               @contextmenu.prevent.stop="openRestoreMenu($event, entry)"
             >
               <div class="tree-main">
+                <input
+                  v-if="isRecoveryEntryRestorable(entry)"
+                  type="checkbox"
+                  class="tree-recovery-checkbox"
+                  :checked="isRecoveryEntrySelected(entry)"
+                  :aria-label="`选择还原 ${entry.label}`"
+                  :disabled="!!restoringRecoveryId"
+                  @click.stop
+                  @change="toggleRecoverySelection(entry)"
+                >
                 <button
                   v-if="entry.hasChildren"
                   type="button"
@@ -458,7 +480,7 @@
           <Trash2 :size="15" :stroke-width="2.3" />
           <span>{{ isTreeDirectory(restoreMenu.entry) ? '删除目录' : '删除文件' }}</span>
         </button>
-        <div class="task-filter-restore-menu__hint">从库存中删除，不可恢复</div>
+        <div class="task-filter-restore-menu__hint">移入本任务恢复区，可再次还原</div>
       </template>
     </div>
   </Teleport>
@@ -523,6 +545,19 @@ const treeScrollRef = ref(null)
 const TREE_ROW_HEIGHT = 34
 const TREE_ROW_OVERSCAN = 18
 const treeRows = computed(() => props.fileTreeSections?.[0]?.rows || [])
+const selectedRecoveryKeys = ref(new Set())
+const restorableRecoveryEntries = computed(() => treeRows.value.filter(entry => (
+  getFilterRestoreAvailability(entry, props.item).enabled
+)))
+const selectedRecoveryEntries = computed(() => {
+  const selected = restorableRecoveryEntries.value.filter(entry => (
+    selectedRecoveryKeys.value.has(restoreEntryKey(entry))
+  ))
+  const selectedDirectories = selected.filter(entry => isTreeDirectory(entry))
+  return selected.filter(entry => !selectedDirectories.some(directory => (
+    entry.key !== directory.key && String(entry.key || '').startsWith(`${directory.key}/`)
+  )))
+})
 const treeRowVirtualizer = useVirtualizer(computed(() => ({
   count: treeRows.value.length,
   getScrollElement: () => treeScrollRef.value,
@@ -556,6 +591,11 @@ const treeVirtualCanvasStyle = computed(() => ({
 watch(() => treeRows.value.length, () => {
   nextTick(() => treeRowVirtualizer.value.measure())
 }, { flush: 'post' })
+
+watch(() => props.item?.id, () => {
+  selectedRecoveryKeys.value = new Set()
+  closeRestoreMenu()
+})
 
 onMounted(() => {
   nextTick(() => treeRowVirtualizer.value.measure())
@@ -602,10 +642,32 @@ function closeRestoreMenu() {
   restoreMenu.value = null
 }
 
+function isRecoveryEntryRestorable(entry) {
+  return getFilterRestoreAvailability(entry, props.item).enabled
+}
+
+function isRecoveryEntrySelected(entry) {
+  return selectedRecoveryKeys.value.has(restoreEntryKey(entry))
+}
+
+function toggleRecoverySelection(entry) {
+  const key = restoreEntryKey(entry)
+  if (!key || !isRecoveryEntryRestorable(entry) || props.restoringRecoveryId) return
+  const next = new Set(selectedRecoveryKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  selectedRecoveryKeys.value = next
+}
+
+function restoreCheckedEntries() {
+  if (!selectedRecoveryEntries.value.length || props.restoringRecoveryId) return
+  emit('restore-filtered', { entries: selectedRecoveryEntries.value })
+}
+
 function restoreSelectedEntry() {
   const current = restoreMenu.value
   if (!current || current.kind !== 'restore') return
-  if (!current?.availability?.enabled || props.restoringRecoveryId === restoreEntryKey(current.entry)) return
+  if (!current?.availability?.enabled || props.restoringRecoveryId) return
   emit('restore-filtered', { entry: current.entry })
   closeRestoreMenu()
 }
@@ -770,6 +832,7 @@ const ACTION_ICON_MAP = {
   cancel: XCircle,
   retry: RotateCcw,
   retry_waiting: RotateCcw,
+  rollback_ai_title: RotateCcw,
   delete: Trash2,
   delete_waiting_retry: Trash2,
   open_subtitle_import: ArrowRight,
@@ -784,6 +847,7 @@ const ACTION_LABEL_MAP = {
   delete: '删除',
   retry: '重试',
   retry_waiting: '立即重试',
+  rollback_ai_title: '回退汉化修改',
   delete_waiting_retry: '移除等待重试',
   open_subtitle_import: '前往字幕补配',
   open_circle_completion: '前往社团补全',
@@ -808,7 +872,7 @@ function actionToneClass(action) {
   if (action === 'resume') {
     return 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-300 hover:bg-emerald-100 hover:shadow-[0_8px_18px_-8px_rgba(16,185,129,0.3)]'
   }
-  if (action === 'retry' || action === 'retry_waiting' || action === 'reindex_circle') {
+  if (action === 'retry' || action === 'retry_waiting' || action === 'rollback_ai_title' || action === 'reindex_circle') {
     return 'border-indigo-200 bg-indigo-50 text-indigo-700 hover:border-indigo-300 hover:bg-indigo-100 hover:shadow-[0_8px_18px_-8px_rgba(79,70,229,0.3)]'
   }
   if (action === 'open_subtitle_import' || action === 'open_circle_completion') {
@@ -1018,6 +1082,24 @@ function actionToneClass(action) {
 .tree-row-restored {
   border-color: rgba(16, 185, 129, 0.18);
   background: rgba(236, 253, 245, 0.5);
+}
+
+.tree-row-recovery-selected {
+  border-color: rgba(13, 148, 136, 0.3);
+  background: rgba(240, 253, 250, 0.86);
+}
+
+.tree-recovery-checkbox {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  margin: 0;
+  accent-color: #0f766e;
+  cursor: pointer;
+}
+
+.tree-recovery-checkbox:disabled {
+  cursor: not-allowed;
 }
 
 .tree-main-target-restored,

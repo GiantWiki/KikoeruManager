@@ -1352,7 +1352,17 @@ function getFinalOutputDisplay(task) {
 
 function canRetryDownloadTask(task) {
   if (isUploadMode.value) return false
-  const domain = String(task?.task_domain || task?.task_metadata?.task_domain || task?.task_metadata?.download_mode || '').trim()
+  // HTTP/百度状态接口的顶层 download_mode 是稳定的直接下载任务信号；
+  // 不能只识别 metadata 里的 http/baidu_netdisk，否则 gofile、pikpak 等平台会落入
+  // 增强下载兜底，并在“整体失败且 0 个文件”时因失败文件数为 0 而不显示重试。
+  const serializedHttpMode = String(task?.download_mode || '').trim()
+  const domain = String(
+    task?.task_domain ||
+    task?.task_metadata?.task_domain ||
+    (serializedHttpMode ? 'http_download' : '') ||
+    task?.task_metadata?.download_mode ||
+    ''
+  ).trim()
   if (domain === 'http_download' || domain === 'http' || domain === 'baidu_netdisk') {
     return ['failed', 'partial_failed', 'completed'].includes(String(task?.display_status || task?.status || '')) && hasTaskFailures(task)
   }

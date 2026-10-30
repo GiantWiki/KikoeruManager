@@ -203,6 +203,33 @@ export function extractBaiduShareUrls(rows) {
   return extractShareUrls((rows || []).join('\n'), 'baidu')
 }
 
+const BAIDU_STRUCTURED_SEPARATOR_RE = /\s*[|｜]\s*|\t+|\s+-{3,}\s+/
+const BAIDU_PASS_CODE_LABEL_RE = /^(?:提取码|提取口令|访问码|pwd|passcode|pass_code)\s*[:：=]/i
+
+// 插件规范格式（RJ | 链接 | 提取码: x | 解压码: y）只把链接和提取码
+// 交给分享解析；解压码不能被裸串兜底误当成百度提取码。
+export function normalizeBaiduStructuredLine(value) {
+  const text = String(value || '').trim()
+  if (!text || !/[|｜\t]/.test(text)) return text
+  const segments = text.split(BAIDU_STRUCTURED_SEPARATOR_RE).map(item => item.trim()).filter(Boolean)
+  if (segments.length < 2) return text
+  const urlSegment = segments.find(item => platformForUrl(item) === 'baidu')
+  if (!urlSegment) return text
+  const passSegment = segments.find(item => BAIDU_PASS_CODE_LABEL_RE.test(item))
+  const code = passSegment ? extractPassCodeFromSegment(passSegment) : ''
+  return code ? appendSharePassCode(urlSegment, code) : urlSegment
+}
+
+export function baiduInputLineMatchesStartedItem(line, item) {
+  const normalizedLine = normalizeBaiduStructuredLine(line)
+  const [lineUrl] = extractBaiduShareUrls([normalizedLine])
+  const itemUrl = String(item?.share_url || item?.url || item?.masked_url || '').trim()
+  if (!lineUrl || platformForUrl(itemUrl) !== 'baidu') return false
+  const lineIdentity = shareIdentity(lineUrl)
+  const itemIdentity = shareIdentity(itemUrl)
+  return Boolean(lineIdentity && itemIdentity && lineIdentity === itemIdentity)
+}
+
 export function extractHttpShareUrls(rows) {
   return extractShareUrls((rows || []).join('\n'), '')
 }

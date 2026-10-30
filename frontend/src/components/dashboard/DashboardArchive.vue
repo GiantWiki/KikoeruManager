@@ -146,7 +146,7 @@
         </div>
 
         <button
-          v-if="archive.source === 'processed_archive' && getStatusMeta(archive).key === 'failed'"
+          v-if="archive.source === 'processed_archive' && ['completed', 'failed'].includes(getStatusMeta(archive).key)"
           type="button"
           class="group/btn inline-flex h-7 w-7 cursor-pointer items-center justify-center rounded-[7px] border border-slate-300 bg-slate-50 text-slate-600 shadow-[0_1px_0_rgba(15,23,42,0.04),inset_0_1px_0_rgba(255,255,255,0.8)] transition-all duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)] hover:-translate-y-0.5 hover:scale-110 hover:border-slate-400 hover:bg-white hover:text-slate-900 hover:shadow-[0_4px_10px_-4px_rgba(15,23,42,0.18)] active:scale-90 disabled:pointer-events-none disabled:opacity-50"
           :disabled="reprocessingId === archive.id"

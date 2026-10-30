@@ -793,6 +793,20 @@ function handleArchivePageChange(page) {
 }
 
 async function reprocessArchive(archiveId) {
+  const archive = archives.value.find((item) => String(item.id) === String(archiveId))
+  try {
+    await showSystemConfirm({
+      title: '重新解压已归档压缩包',
+      message: `确认重新解压「${archive?.filename || archiveId}」？`,
+      description: '将直接从归档文件重新执行解压、过滤与入库，不依赖旧库存目录；旧库存目录已删除也可以重跑。',
+      tone: 'warning',
+      confirmText: '重新解压',
+      cancelText: '取消',
+    })
+  } catch (_) {
+    return
+  }
+
   reprocessingId.value = archiveId
   try {
     const data = await processedArchiveApi.reprocess(archiveId)
@@ -821,10 +835,28 @@ async function handleTaskCenterAction(task, action) {
       return
     }
   }
+  if (action === 'rollback_ai_title') {
+    try {
+      await showSystemConfirm({
+        title: '回退 AI 汉化修改',
+        message: `确认回退「${task?.title || '该任务'}」已产生的 AI 汉化修改？`,
+        description: '将按任务快照恢复 AI 标题、内部文件名和项目目录；不会覆盖后续手工修改，同名冲突项会跳过。',
+        tone: 'warning',
+        confirmText: '确认回退',
+        cancelText: '取消',
+      })
+    } catch (_) {
+      return
+    }
+  }
   try {
     const result = await taskCenterApi.action(task.id, action)
     if (result?.route_hint) await router.push(result.route_hint)
-    ElMessage.success(result?.message || '操作成功')
+    if (result?.partial || result?.success === false) {
+      ElMessage.warning(result?.message || '部分项目未能回退')
+    } else {
+      ElMessage.success(result?.message || '操作成功')
+    }
     await refreshData()
   } catch (error) {
     console.error('执行任务中心动作失败:', error)

@@ -1,0 +1,175 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
+import Tasks from './Tasks.vue'
+
+const mocks = vi.hoisted(() => ({
+  list: vi.fn(),
+  getItem: vi.fn(),
+  restoreFilteredItem: vi.fn(),
+  confirm: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+  push: vi.fn(),
+}))
+
+vi.mock('../api', () => ({
+  taskCenterApi: {
+    list: mocks.list,
+    getItem: mocks.getItem,
+    restoreFilteredItem: mocks.restoreFilteredItem,
+    action: vi.fn(),
+    getItemFiles: vi.fn(),
+    deleteLibraryItem: vi.fn(),
+  },
+  libraryApi: {
+    browserDelete: vi.fn(),
+  },
+}))
+
+vi.mock('../composables/useSystemPrompt', () => ({
+  showSystemConfirm: mocks.confirm,
+}))
+
+vi.mock('../composables/useViewport', async () => {
+  const { ref } = await import('vue')
+  return { useViewport: () => ({ isMobile: ref(false) }) }
+})
+
+vi.mock('../composables/useRealtimeEvents', async () => {
+  const { ref } = await import('vue')
+  return { useRealtimeEvents: () => ({ connected: ref(true) }) }
+})
+
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: mocks.push }),
+}))
+
+vi.mock('element-plus', () => ({
+  ElMessage: {
+    success: mocks.success,
+    warning: mocks.warning,
+    error: mocks.error,
+  },
+}))
+
+const task = {
+  id: 'task-1',
+  title: '测试任务',
+  status: 'completed',
+  status_label: '已完成',
+  actions: [],
+  details: { metadata: { filter_recovery: { target_ready: true } } },
+}
+
+async function mountTasks() {
+  const wrapper = mount(Tasks, {
+    global: {
+      stubs: {
+        TasksHeader: true,
+        TasksFilters: true,
+        TaskListPane: true,
+        TaskDetailPane: { name: 'TaskDetailPane', template: '<div />' },
+      },
+    },
+  })
+  await flushPromises()
+  await flushPromises()
+  return wrapper
+}
+
+describe('任务中心批量恢复', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    mocks.list.mockResolvedValue({ items: [task], total: 1 })
+    mocks.getItem.mockResolvedValue(task)
+    mocks.confirm.mockResolvedValue(true)
+  })
+
+  it('逐项恢复并汇总部分失败', async () => {
+    mocks.restoreFilteredItem
+      .mockResolvedValueOnce({ message: '已还原到库存' })
+      .mockRejectedValueOnce({ response: { data: { detail: '目标已存在' } } })
+    const wrapper = await mountTasks()
+    const detail = wrapper.findComponent({ name: 'TaskDetailPane' })
+
+    detail.vm.$emit('restore-filtered', {
+      entries: [
+        { key: 'a.txt', label: 'a.txt', type: 'file', recoveryId: 'recovery-1', recoveryKey: 'recovery-1' },
+        { key: 'b.txt', label: 'b.txt', type: 'file', recoveryId: 'recovery-2', recoveryKey: 'recovery-2' },
+      ],
+    })
+    await flushPromises()
+    await flushPromises()
+
+    expect(mocks.confirm).toHaveBeenCalledTimes(1)
+    expect(mocks.restoreFilteredItem).toHaveBeenNthCalledWith(1, 'task-1', 'recovery-1', '')
+    expect(mocks.restoreFilteredItem).toHaveBeenNthCalledWith(2, 'task-1', 'recovery-2', '')
+    expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('已还原 1 项，1 项失败'))
+    expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('目标已存在'))
+    expect(mocks.error).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('批量全部成功时汇总成功数量', async () => {
+    mocks.restoreFilteredItem.mockResolvedValue({ message: '已还原到库存' })
+    const wrapper = await mountTasks()
+    const detail = wrapper.findComponent({ name: 'TaskDetailPane' })
+
+    detail.vm.$emit('restore-filtered', {
+      entries: [
+        { key: 'a.txt', label: 'a.txt', type: 'file', recoveryId: 'recovery-1', recoveryKey: 'recovery-1' },
+        { key: 'b.txt', label: 'b.txt', type: 'file', recoveryId: 'recovery-2', recoveryKey: 'recovery-2' },
+      ],
+    })
+    await flushPromises()
+    await flushPromises()
+
+    expect(mocks.restoreFilteredItem).toHaveBeenCalledTimes(2)
+    expect(mocks.success).toHaveBeenCalledWith('已还原 2 项到库存')
+    expect(mocks.warning).not.toHaveBeenCalled()
+    expect(mocks.error).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('批量全部失败时继续逐项处理并汇总原因', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mocks.restoreFilteredItem
+      .mockRejectedValueOnce(new Error('第一项失败'))
+      .mockRejectedValueOnce(new Error('第二项失败'))
+    const wrapper = await mountTasks()
+    const detail = wrapper.findComponent({ name: 'TaskDetailPane' })
+
+    detail.vm.$emit('restore-filtered', {
+      entries: [
+        { key: 'a.txt', label: 'a.txt', type: 'file', recoveryId: 'recovery-1', recoveryKey: 'recovery-1' },
+        { key: 'b.txt', label: 'b.txt', type: 'file', recoveryId: 'recovery-2', recoveryKey: 'recovery-2' },
+      ],
+    })
+    await flushPromises()
+    await flushPromises()
+
+    expect(mocks.restoreFilteredItem).toHaveBeenCalledTimes(2)
+    expect(mocks.error).toHaveBeenCalledWith(expect.stringContaining('a.txt（第一项失败）'))
+    expect(mocks.error).toHaveBeenCalledWith(expect.stringContaining('b.txt（第二项失败）'))
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.warning).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('保留单项恢复调用和成功反馈', async () => {
+    mocks.restoreFilteredItem.mockResolvedValue({ message: '单文件已还原' })
+    const wrapper = await mountTasks()
+    const detail = wrapper.findComponent({ name: 'TaskDetailPane' })
+
+    detail.vm.$emit('restore-filtered', {
+      entry: { key: 'a.txt', label: 'a.txt', type: 'file', recoveryId: 'recovery-1', recoveryKey: 'recovery-1' },
+    })
+    await flushPromises()
+    await flushPromises()
+
+    expect(mocks.restoreFilteredItem).toHaveBeenCalledWith('task-1', 'recovery-1', '')
+    expect(mocks.success).toHaveBeenCalledWith('单文件已还原')
+    wrapper.unmount()
+  })
+})

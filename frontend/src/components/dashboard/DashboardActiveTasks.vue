@@ -234,6 +234,7 @@ const ACTION_ICON_MAP = {
   cancel: XCircle,
   retry: RotateCcw,
   retry_waiting: RotateCcw,
+  rollback_ai_title: RotateCcw,
   delete: Trash2,
   delete_waiting_retry: Trash2,
   open_route: ArrowRight,
@@ -248,6 +249,7 @@ const ACTION_LABEL_MAP = {
   delete: '删除',
   retry: '重试',
   retry_waiting: '立即重试',
+  rollback_ai_title: '回退汉化修改',
   delete_waiting_retry: '移除',
   open_route: '查看处理',
   open_tasks: '查看任务详情',
@@ -497,7 +499,7 @@ function actionIconClass(action) {
   if (action === 'cancel' || action === 'delete' || action === 'delete_waiting_retry') return 'text-rose-600'
   if (action === 'pause') return 'text-amber-600'
   if (action === 'resume') return 'text-emerald-600'
-  if (action === 'retry' || action === 'retry_waiting') return 'text-amber-600'
+  if (action === 'retry' || action === 'retry_waiting' || action === 'rollback_ai_title') return 'text-amber-600'
   return 'text-slate-500'
 }
 

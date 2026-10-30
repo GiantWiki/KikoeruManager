@@ -200,6 +200,18 @@ export const taskCenterApi = {
       relativePath ? { relative_path: relativePath } : {}
     )
     return response.data
+  },
+
+  deleteLibraryItem: async (itemId, relativePath, libraryId = '') => {
+    const response = await apiClient.post(
+      `/task-center/${encodeURIComponent(itemId)}/library-items/delete`,
+      {
+        relative_path: relativePath,
+        library_id: libraryId || null,
+        confirmed: true,
+      }
+    )
+    return response.data
   }
 }
 

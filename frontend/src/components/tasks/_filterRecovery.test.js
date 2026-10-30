@@ -107,4 +107,69 @@ describe('任务过滤项恢复状态', () => {
     expect(wrapper.emitted('restore-filtered')?.[0]?.[0]?.entry?.recoveryId).toBe('recovery-1')
     wrapper.unmount()
   })
+
+  it('支持多选恢复，并用已选目录覆盖其子文件', async () => {
+    const wrapper = mount(TaskDetailPane, {
+      props: {
+        item: { ...completedTask, id: 'engine:task-1', title: '任务', actions: [] },
+        fileTreeSections: [{
+          key: 'files',
+          label: '文件列表',
+          removedCount: 3,
+          rows: [
+            {
+              key: 'folder',
+              label: 'folder',
+              type: 'dir',
+              status: 'removed',
+              recoveryId: 'directory-recovery-1',
+              recoveryKey: 'directory-recovery-1',
+              depth: 0,
+              hasChildren: true,
+            },
+            {
+              key: 'folder/a.txt',
+              label: 'a.txt',
+              type: 'file',
+              status: 'removed',
+              recoveryId: 'directory-recovery-1',
+              recoveryRelativePath: 'a.txt',
+              recoveryKey: 'directory-recovery-1:a.txt',
+              removedByDirectory: 'folder',
+              depth: 1,
+              hasChildren: false,
+            },
+            {
+              key: 'other.txt',
+              label: 'other.txt',
+              type: 'file',
+              status: 'removed',
+              recoveryId: 'recovery-2',
+              recoveryKey: 'recovery-2',
+              depth: 0,
+              hasChildren: false,
+            },
+          ],
+        }],
+        formatRJCode: () => '',
+        formatDateTime: () => '-',
+        showProgress: () => false,
+        getRecoveredNotice: () => '',
+        getDLsiteFailureReason: () => '',
+        getOutputPath: () => '',
+      },
+    })
+
+    const checkboxes = wrapper.findAll('.tree-recovery-checkbox')
+    expect(checkboxes).toHaveLength(3)
+    for (const checkbox of checkboxes) await checkbox.setValue(true)
+    await wrapper.get('.task-tree-restore-selected').trigger('click')
+
+    const payload = wrapper.emitted('restore-filtered')?.[0]?.[0]
+    expect(payload.entries.map(entry => entry.recoveryKey)).toEqual([
+      'directory-recovery-1',
+      'recovery-2',
+    ])
+    wrapper.unmount()
+  })
 })
