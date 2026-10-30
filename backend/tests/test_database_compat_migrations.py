@@ -299,6 +299,73 @@ def test_unique_library_index_is_created_concurrently():
     assert sql.startswith("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ")
 
 
+def test_library_index_retired_indexes_are_dropped_without_recreation(monkeypatch):
+    retired = {
+        "idx_lie_rj_lookup",
+        "idx_lie_rj_prefix",
+        "idx_lie_circle_dir_lookup",
+        "idx_lie_indexed_at_id",
+        "idx_lie_generation_indexed_at",
+    }
+    desired = {str(spec["name"]) for spec in database._POSTGRES_LIBRARY_INDEX_SPECS}
+    assert retired.isdisjoint(desired)
+    assert retired <= set(database._POSTGRES_LIBRARY_OBSOLETE_INDEX_NAMES)
+    # 查重版本文件仍有跨 generation 的相对路径范围查询，本轮不能删除这个兼容索引。
+    assert "idx_lie_subtree_path_pattern" in desired
+
+    trigram_names = {
+        str(spec["name"])
+        for spec in database._POSTGRES_LIBRARY_TRIGRAM_INDEX_SPECS
+    }
+    states = {
+        name: {"indexdef": "", "valid": True, "ready": True}
+        for name in desired | trigram_names | retired
+    }
+    executed = []
+
+    class FakeConn:
+        def execution_options(self, **_kwargs):
+            return self
+
+        def execute(self, stmt, *_args, **_kwargs):
+            executed.append(str(stmt))
+
+        def close(self):
+            return None
+
+    class FakeEngine:
+        def __init__(self):
+            self.conn = FakeConn()
+
+        def connect(self):
+            return self.conn
+
+    monkeypatch.setattr(
+        database,
+        "_load_index_states",
+        lambda _conn, names: {
+            name: states[name]
+            for name in names
+            if name in states
+        },
+    )
+    monkeypatch.setattr(database, "_index_definition_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(database, "configure_postgres_online_maintenance_connection", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(database, "release_postgres_online_maintenance_lock", lambda *_args, **_kwargs: None)
+
+    result = database.ensure_library_index_postgres_indexes_concurrently(FakeEngine())
+
+    assert result["ok"] is True
+    assert result["created"] == []
+    assert result["recreated"] == []
+    assert set(result["dropped"]) == retired
+    drop_sql = [sql for sql in executed if sql.startswith("DROP INDEX")]
+    assert len(drop_sql) == len(retired)
+    assert all(sql.startswith("DROP INDEX CONCURRENTLY IF EXISTS") for sql in drop_sql)
+    assert not any(sql.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX")) for sql in executed)
+    assert "ANALYZE library_index_entries" in executed
+
+
 def test_compat_status_schema_adds_materializer_watermarks(monkeypatch):
     executed = []
     added = []

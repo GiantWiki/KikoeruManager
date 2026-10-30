@@ -2486,44 +2486,13 @@ _POSTGRES_LIBRARY_INDEX_SPECS = (
         "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_lie_library_generation_rel ON library_index_entries(library_id, generation, relative_path)",
         "fragments": ("library_index_entries", "UNIQUE", "library_id", "generation", "relative_path"),
     },
-    {
-        "name": "idx_lie_rj_lookup",
-        "sql": (
-            "CREATE INDEX IF NOT EXISTS idx_lie_rj_lookup "
-            "ON library_index_entries(rjcode, depth, relative_path, library_id, entry_type) "
-            "WHERE rjcode IS NOT NULL"
-        ),
-        "fragments": ("library_index_entries", "rjcode", "depth", "relative_path", "library_id", "entry_type", "WHERE", "rjcode IS NOT NULL"),
-    },
-    {
-        "name": "idx_lie_rj_prefix",
-        "sql": (
-            "CREATE INDEX IF NOT EXISTS idx_lie_rj_prefix "
-            "ON library_index_entries(rjcode varchar_pattern_ops, depth, relative_path, library_id, entry_type) "
-            "WHERE rjcode IS NOT NULL"
-        ),
-        "fragments": ("library_index_entries", "rjcode", "varchar_pattern_ops", "depth", "relative_path", "library_id", "entry_type", "WHERE", "rjcode IS NOT NULL"),
-    },
-    {
-        "name": "idx_lie_circle_dir_lookup",
-        "sql": (
-            "CREATE INDEX IF NOT EXISTS idx_lie_circle_dir_lookup "
-            "ON library_index_entries(library_id, rjcode, relative_path, depth) "
-            "WHERE entry_type = 'dir' AND rjcode IS NOT NULL"
-        ),
-        "fragments": ("library_index_entries", "library_id", "rjcode", "relative_path", "depth", "WHERE", "entry_type", "dir", "rjcode IS NOT NULL"),
-    },
-    {
-        "name": "idx_lie_indexed_at_id",
-        "sql": "CREATE INDEX IF NOT EXISTS idx_lie_indexed_at_id ON library_index_entries(library_id, indexed_at, id)",
-        "fragments": ("library_index_entries", "library_id", "indexed_at", "id"),
-    },
+    # 查重版本文件仍按 library_id + relative_path 跨 generation 查询；调用方改造前保留旧子树索引。
     {
         "name": "idx_lie_subtree_path_pattern",
         "sql": "CREATE INDEX IF NOT EXISTS idx_lie_subtree_path_pattern ON library_index_entries(library_id, relative_path text_pattern_ops)",
         "fragments": ("library_index_entries", "library_id", "relative_path", "text_pattern_ops"),
     },
-    # expand 阶段保留上面的旧索引；新代码显式限定 active generation 后使用下列索引。
+    # active generation 查询使用下列索引；已由首列 rjcode 承接的旧 RJ 索引不再重复保留。
     {
         "name": "idx_lie_generation_rj_lookup",
         "sql": (
@@ -2550,11 +2519,6 @@ _POSTGRES_LIBRARY_INDEX_SPECS = (
             "WHERE entry_type = 'dir' AND rjcode IS NOT NULL"
         ),
         "fragments": ("library_index_entries", "library_id", "generation", "rjcode", "relative_path", "depth", "WHERE", "entry_type", "dir", "rjcode IS NOT NULL"),
-    },
-    {
-        "name": "idx_lie_generation_indexed_at",
-        "sql": "CREATE INDEX IF NOT EXISTS idx_lie_generation_indexed_at ON library_index_entries(library_id, generation, indexed_at, id)",
-        "fragments": ("library_index_entries", "library_id", "generation", "indexed_at", "id"),
     },
     {
         "name": "idx_lie_generation_children_name",
@@ -2630,6 +2594,12 @@ _POSTGRES_OBSOLETE_INDEX_NAMES = (
 
 _POSTGRES_LIBRARY_OBSOLETE_INDEX_NAMES = (
     # 库存索引：旧 btree / 多 GIN 写放大明显，已由复合业务索引和合并 trigram 表达式索引覆盖。
+    # 旧 RJ 精确/前缀索引由 generation 版首列 rjcode 承接；indexed_at 没有运行时过滤或排序查询。
+    "idx_lie_rj_lookup",
+    "idx_lie_rj_prefix",
+    "idx_lie_circle_dir_lookup",
+    "idx_lie_indexed_at_id",
+    "idx_lie_generation_indexed_at",
     # generation 版 size/time 统一使用一个 B-tree，降序由反向扫描完成。
     "idx_lie_generation_children_size_desc",
     "idx_lie_generation_children_time_desc",
