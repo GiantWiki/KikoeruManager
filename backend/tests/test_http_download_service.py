@@ -4,6 +4,7 @@ import types
 
 import pytest
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 from app.core.http_download_service import (
@@ -1535,6 +1536,77 @@ async def test_preview_urls_uses_resolved_pikpak_urls(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_preview_selection_keeps_pikpak_probe_failure_with_other_files(monkeypatch, tmp_path):
+    bind_config(monkeypatch, tmp_path)
+    service = HttpDownloadService()
+    source_items = [
+        {
+            "source": "pikpak",
+            "share_url": "https://mypikpak.com/s/share-id",
+            "original_url": f"https://cdn.example.com/voice.7z.{suffix}?token=secret",
+            "file_id": f"file-{suffix}",
+            "download_file_id": f"copy-file-{suffix}",
+            "filename": f"voice.7z.{suffix}",
+            "size_bytes": 20,
+        }
+        for suffix in ("001", "003")
+    ]
+
+    async def fake_resolve_source_urls(*_args, **_kwargs):
+        return {
+            "urls": [item["original_url"] for item in source_items],
+            "source_items": source_items,
+            "failed_items": [],
+            "source_modes": ["pikpak"],
+        }
+
+    async def fake_preview_url(raw_url, target_subdir="", conflict_policy="", headers=None):
+        if raw_url.endswith("003?token=secret"):
+            return {
+                "ok": False,
+                "url": raw_url,
+                "masked_url": service._mask_url(raw_url),
+                "reason": "Cannot connect to host cdn.example.com:443 ssl:default [None]",
+            }
+        return {
+            "ok": True,
+            "url": raw_url,
+            "masked_url": service._mask_url(raw_url),
+            "host": "cdn.example.com",
+            "filename": "voice.7z.001",
+            "relative_path": "voice.7z.001",
+            "final_path": str(tmp_path / "downloads" / "voice.7z.001"),
+            "target_dir": str(tmp_path / "downloads"),
+            "size_bytes": 20,
+            "resumable": True,
+        }
+
+    monkeypatch.setattr(service, "resolve_source_urls", fake_resolve_source_urls)
+    monkeypatch.setattr(service, "preview_url", fake_preview_url)
+
+    preview = await service.preview_urls(
+        ["https://mypikpak.com/s/share-id"],
+        materialize_sources=True,
+    )
+    filtered = service.filter_preview_selection(
+        preview,
+        selected_items=[
+            {"source": "pikpak", "file_id": "file-001", "filename": "voice.7z.001"},
+            {"source": "pikpak", "file_id": "file-003", "filename": "voice.7z.003"},
+        ],
+    )
+
+    assert filtered["ok_count"] == 1
+    assert filtered["failed_count"] == 1
+    failure = next(item for item in filtered["items"] if not item.get("ok"))
+    assert failure["source"] == "pikpak"
+    assert failure["file_id"] == "file-003"
+    assert failure["download_file_id"] == "copy-file-003"
+    assert failure["filename"] == "voice.7z.003"
+    assert "Cannot connect to host" in failure["reason"]
+
+
+@pytest.mark.asyncio
 async def test_preview_urls_shows_pikpak_share_without_materializing(monkeypatch, tmp_path):
     bind_config(monkeypatch, tmp_path)
     service = HttpDownloadService()
@@ -2667,6 +2739,39 @@ def test_filter_preview_selection_preserves_source_failure_rows_without_keys():
     assert filtered["ok_count"] == 0
     assert filtered["failed_count"] == 1
     assert filtered["items"][0]["reason"] == preview["items"][0]["reason"]
+
+
+def test_filter_preview_selection_keeps_share_failure_with_successful_file():
+    service = HttpDownloadService()
+    selected = {
+        "ok": True,
+        "source": "pikpak",
+        "file_id": "file-001",
+        "filename": "voice.7z.001",
+    }
+    preview = {
+        "success": True,
+        "items": [
+            selected,
+            {
+                "ok": False,
+                "source": "pikpak",
+                "masked_url": "https://mypikpak.com/s/****",
+                "reason": "PikPak 分享中有 1 个文件未能转存",
+            },
+        ],
+        "ok_count": 1,
+        "failed_count": 1,
+    }
+
+    filtered = service.filter_preview_selection(
+        preview,
+        selected_items=[selected],
+    )
+
+    assert filtered["ok_count"] == 1
+    assert filtered["failed_count"] == 1
+    assert "未能转存" in filtered["items"][-1]["reason"]
 
 
 def test_gofile_selection_key_stable_across_download_row_shape():
@@ -4007,6 +4112,64 @@ async def test_start_download_task_reports_share_failure_detail(monkeypatch, tmp
 
     assert "多账号空间仍不足" in str(excinfo.value)
     assert task.task_metadata["failed_files"]
+
+
+@pytest.mark.asyncio
+async def test_start_download_task_aborts_when_pikpak_source_item_has_no_result(monkeypatch, tmp_path):
+    bind_config(monkeypatch, tmp_path)
+    service = HttpDownloadService()
+    source_items = [
+        {
+            "source": "pikpak",
+            "share_url": "https://mypikpak.com/s/share",
+            "url": f"https://cdn.example.com/voice.7z.{suffix}?token=secret",
+            "file_id": f"file-{suffix}",
+            "download_file_id": f"copy-file-{suffix}",
+            "filename": f"voice.7z.{suffix}",
+            "size_bytes": 20,
+        }
+        for suffix in ("001", "003")
+    ]
+
+    async def fake_preview_urls(*_args, **_kwargs):
+        return {
+            "items": [{
+                "ok": True,
+                "source": "pikpak",
+                "url": source_items[0]["url"],
+                "masked_url": service._mask_url(source_items[0]["url"]),
+                "file_id": "file-001",
+                "download_file_id": "copy-file-001",
+                "filename": "voice.7z.001",
+                "relative_path": "voice.7z.001",
+                "final_path": str(tmp_path / "downloads" / "voice.7z.001"),
+                "target_dir": str(tmp_path / "downloads"),
+                "size_bytes": 20,
+            }],
+            "resolved_urls": [item["url"] for item in source_items],
+            "source_items": source_items,
+            "existing_rows": [],
+            "failed_items": [],
+            "source_modes": ["pikpak"],
+        }
+
+    rpc_call = AsyncMock()
+    monkeypatch.setattr(service, "preview_urls", fake_preview_urls)
+    monkeypatch.setattr(service, "_rpc_call", rpc_call)
+    monkeypatch.setattr(service, "_cleanup_task_pikpak_transfers", AsyncMock())
+    monkeypatch.setattr(service, "_remove_task_gids", AsyncMock())
+    task = Task(
+        task_type=TaskType.HTTP_DOWNLOAD,
+        source_path="mypikpak.com",
+        metadata={"urls": ["https://mypikpak.com/s/share"]},
+    )
+
+    with pytest.raises(HttpDownloadError, match="完整性校验") as excinfo:
+        await service.start_download_task(task)
+
+    assert "voice.7z.003" in str(excinfo.value)
+    assert task.task_metadata["failed_files"][0]["file_id"] == "file-003"
+    rpc_call.assert_not_called()
 
 
 def test_pick_pikpak_batch_files_packs_greedily_within_safety_margin(monkeypatch, tmp_path):

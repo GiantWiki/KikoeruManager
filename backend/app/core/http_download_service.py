@@ -1048,7 +1048,27 @@ class HttpDownloadService:
             key = self._preview_item_selection_key(item)
             selected_transferit = None
             if key not in keys:
-                if str(item.get("source") or "").strip().lower() != "transferit":
+                source_name = str(item.get("source") or "").strip().lower()
+                is_share_level_failure = (
+                    not item.get("ok")
+                    and source_name in _SHARE_PREVIEW_ONLY_SOURCES
+                    and bool(str(item.get("reason") or item.get("failure_reason") or "").strip())
+                    and not any(
+                        str(item.get(identity_key) or "").strip()
+                        for identity_key in (
+                            "content_id",
+                            "file_id",
+                            "download_file_id",
+                            "transferit_node_handle",
+                        )
+                    )
+                )
+                if is_share_level_failure:
+                    # 分享级错误不属于某个可选文件，但必须与已成功解析的文件一起
+                    # 透传；否则只要其它文件成功，真实失败原因就会被选择过滤吞掉。
+                    items.append(dict(item))
+                    continue
+                if source_name != "transferit":
                     continue
                 selected_transferit = transferit_selected_item(item)
                 if selected_transferit is None:
@@ -5448,6 +5468,35 @@ class HttpDownloadService:
                     item["aria2_header"] = list(source_item.get("aria2_header") or [])
                 if source_item.get("headers"):
                     item["headers"] = dict(source_item.get("headers") or {})
+            if (
+                isinstance(source_item, dict)
+                and source_item.get("source") == "pikpak"
+                and not item.get("ok")
+            ):
+                # preview_url() 的连接/响应失败行本身只有 URL 和 reason。必须补回
+                # 分享文件身份，选择过滤与下载前完整性校验才能识别具体缺了哪一卷。
+                item["source"] = "pikpak"
+                if source_item.get("share_url"):
+                    item["share_url"] = source_item.get("share_url")
+                if not item.get("filename") and (source_item.get("filename") or source_item.get("name")):
+                    item["filename"] = source_item.get("filename") or source_item.get("name")
+                if not item.get("relative_dir") and source_item.get("relative_dir"):
+                    item["relative_dir"] = source_item.get("relative_dir")
+                if not int(item.get("size_bytes") or 0) and source_item.get("size_bytes"):
+                    item["size_bytes"] = int(source_item.get("size_bytes") or 0)
+                for meta_key in (
+                    "content_id",
+                    "file_id",
+                    "download_file_id",
+                    "pikpak_cleanup_file_id",
+                    "pikpak_materialized",
+                    "share_id",
+                    "pikpak_account_id",
+                    "pikpak_account_label",
+                    "pikpak_transfer_dir",
+                ):
+                    if source_item.get(meta_key) is not None and source_item.get(meta_key) != "":
+                        item[meta_key] = source_item.get(meta_key)
             items.append(item)
         for source_item in source.get("source_items") or []:
             if (
@@ -6823,6 +6872,62 @@ class HttpDownloadService:
                 "speed_bytes_per_sec": 0,
             }
             raise HttpDownloadError(failure_reason)
+        # PikPak 的每个 source_item 都必须有明确去向：待下载、失败或本地已完成。
+        # 这是提交 RPC 前的最终防漏行闸门，避免任何预览/选择回归再次把缺卷任务
+        # 当成成功任务交给解压器。正常选择子集不受影响：source_items 已在解析阶段
+        # 按所选文件裁剪。
+        pikpak_source_items = [
+            item for item in list(preview.get("source_items") or [])
+            if isinstance(item, dict)
+            and str(item.get("source") or "").strip().lower() == "pikpak"
+            and not item.get("preview_only")
+        ]
+        if pikpak_source_items:
+            identity_keys = ("file_id", "download_file_id", "pikpak_cleanup_file_id")
+            accounted_rows = [*items, *failed_items, *pre_completed_rows]
+            accounted_identities = {
+                str(row.get(identity_key) or "").strip()
+                for row in accounted_rows
+                if isinstance(row, dict)
+                for identity_key in identity_keys
+                if str(row.get(identity_key) or "").strip()
+            }
+            accounted_selection_keys = {
+                self._preview_item_selection_key(row)
+                for row in accounted_rows
+                if isinstance(row, dict)
+                and str(row.get("source") or "").strip().lower() == "pikpak"
+            }
+            missing_source_items = []
+            for source_item in pikpak_source_items:
+                source_identities = {
+                    str(source_item.get(identity_key) or "").strip()
+                    for identity_key in identity_keys
+                    if str(source_item.get(identity_key) or "").strip()
+                }
+                if source_identities:
+                    if not source_identities.isdisjoint(accounted_identities):
+                        continue
+                elif self._preview_item_selection_key(source_item) in accounted_selection_keys:
+                    continue
+                missing_source_items.append(source_item)
+            if missing_source_items:
+                logger.error(
+                    "[PikPak] 下载前完整性校验发现文件无下载结果 task=%s missing=%s",
+                    getattr(task, "id", ""),
+                    [str(item.get("filename") or item.get("name") or "") for item in missing_source_items],
+                )
+                for source_item in missing_source_items:
+                    failed_item = dict(source_item)
+                    failed_item.update({
+                        "ok": False,
+                        "source": "pikpak",
+                        "masked_url": source_item.get("masked_url") or self._mask_url(
+                            str(source_item.get("url") or source_item.get("original_url") or source_item.get("share_url") or "")
+                        ),
+                        "reason": "PikPak 文件在下载前完整性校验中缺失，未进入成功、失败或已完成明细",
+                    })
+                    failed_items.append(failed_item)
         # 分享类(PikPak/Transfer.it)通常是同一作品的分卷，缺任一文件即无法解压；
         # 只要有分享文件解析失败就整体中止并报明细，避免下载残缺分卷后续解压必然失败。
         share_failed = [
