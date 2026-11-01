@@ -2412,6 +2412,29 @@ class TaskCenterService:
         requested_field = self._safe_text(field) or "download_files"
         if requested_field not in self.PAGINATED_DETAIL_FIELDS:
             requested_field = "download_files"
+        if requested_field in {
+            "final_file_tree_items",
+            "extracted_file_tree_items",
+            "file_tree_items",
+        }:
+            # 最终/解压文件树可能只在 detail 序列化时由目录快照派生，原始任务
+            # 元数据里并没有同名字段。分页必须复用同一份补全逻辑，但不能复用
+            # 已截断的详情数组，否则 200 条之后仍无法加载。
+            source_path = self._safe_text(task.source_path)
+            output_path = self._safe_text(task.output_path)
+            resolved_target_path = (
+                output_path
+                or self._safe_text(metadata.get("subtitle_dir"))
+                or self._safe_text(metadata.get("target_folder_path"))
+                or self._safe_text(metadata.get("folder_path"))
+            )
+            metadata = self._ensure_file_tree_metadata(
+                metadata,
+                resolved_target_path,
+                source_path,
+                domain,
+                task.status.value,
+            )
         rows = metadata.get(requested_field)
         if not isinstance(rows, list):
             rows = []

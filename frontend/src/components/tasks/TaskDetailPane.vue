@@ -545,6 +545,7 @@ const treeScrollRef = ref(null)
 const fallbackTreeScrollTop = ref(0)
 const TREE_ROW_HEIGHT = 34
 const TREE_ROW_OVERSCAN = 18
+const TREE_VIRTUALIZATION_THRESHOLD = 200
 const treeRows = computed(() => props.fileTreeSections?.[0]?.rows || [])
 const selectedRecoveryKeys = ref(new Set())
 const restorableRecoveryEntries = computed(() => treeRows.value.filter(entry => (
@@ -566,9 +567,14 @@ const treeRowVirtualizer = useVirtualizer(computed(() => ({
   overscan: TREE_ROW_OVERSCAN,
 })))
 const virtualTreeRows = computed(() => {
-  const rows = treeRowVirtualizer.value.getVirtualItems()
-    .map(virtualRow => ({ virtualRow, entry: treeRows.value[virtualRow.index] }))
-    .filter(item => item.entry)
+  // 详情首屏最多只有 200 项，小树直接按真实滚动位置渲染即可。折叠/展开时
+  // 不采用虚拟器可能短暂保留的旧坐标，避免行被绘制到画布外形成白屏；
+  // 加载更多后的大文件树仍使用虚拟滚动，避免一次渲染过多节点。
+  const rows = treeRows.value.length > TREE_VIRTUALIZATION_THRESHOLD
+    ? treeRowVirtualizer.value.getVirtualItems()
+      .map(virtualRow => ({ virtualRow, entry: treeRows.value[virtualRow.index] }))
+      .filter(item => item.entry)
+    : []
   if (rows.length || !treeRows.value.length) return rows
 
   // 虚拟器尚未测量时也按真实滚动位置渲染，避免始终停留在首屏。

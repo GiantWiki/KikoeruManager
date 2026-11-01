@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   warning: vi.fn(),
   error: vi.fn(),
   push: vi.fn(),
+  virtualizerMode: 'empty',
 }))
 
 vi.mock('../api', () => ({
@@ -54,6 +55,23 @@ vi.mock('element-plus', () => ({
   },
 }))
 
+vi.mock('@tanstack/vue-virtual', async () => {
+  const { computed } = await import('vue')
+  return {
+    useVirtualizer: (options) => computed(() => ({
+      count: options.value.count,
+      getVirtualItems: () => {
+        if (mocks.virtualizerMode === 'stale' && options.value.count > 1) {
+          return [{ index: 0, key: 'stale-row', start: 100000, size: 34 }]
+        }
+        return []
+      },
+      getTotalSize: () => options.value.count * 34,
+      measure: vi.fn(),
+    })),
+  }
+})
+
 const task = {
   id: 'task-1',
   title: '测试任务',
@@ -71,6 +89,21 @@ async function mountTasks() {
         TasksFilters: true,
         TaskListPane: true,
         TaskDetailPane: { name: 'TaskDetailPane', props: ['fileTreeSections'], template: '<div />' },
+      },
+    },
+  })
+  await flushPromises()
+  await flushPromises()
+  return wrapper
+}
+
+async function mountTasksWithDetail() {
+  const wrapper = mount(Tasks, {
+    global: {
+      stubs: {
+        TasksHeader: true,
+        TasksFilters: true,
+        TaskListPane: true,
       },
     },
   })
@@ -224,6 +257,87 @@ describe('任务中心批量恢复', () => {
 })
 
 describe('任务文件树虚拟列表', () => {
+  it('派生文件树折叠后重新展开仍渲染文件行', async () => {
+    const treeTask = {
+      ...task,
+      details: {
+        metadata: {
+          file_tree_view_kind: 'extracted_snapshot',
+          extracted_file_tree_root_label: 'RJ01435183',
+          extracted_file_tree_items: [
+            { relative_path: '01.正篇音声', name: '01.正篇音声', type: 'dir' },
+            { relative_path: '01.正篇音声/01.wav', name: '01.wav', type: 'file', size: 12 },
+            { relative_path: '02.附赠/插画', name: '插画', type: 'dir' },
+            { relative_path: '02.附赠/插画/主插画.png', name: '主插画.png', type: 'file', size: 34 },
+          ],
+        },
+      },
+    }
+    mocks.list.mockResolvedValue({ items: [treeTask], total: 1 })
+    mocks.getItem.mockResolvedValue(treeTask)
+    const wrapper = await mountTasksWithDetail()
+    const findTreeToggle = () => wrapper.findAll('button').find(button => (
+      ['展开文件树', '收起文件树'].includes(button.text())
+    ))
+
+    expect(findTreeToggle()?.text()).toBe('收起文件树')
+    await findTreeToggle().trigger('click')
+    await flushPromises()
+    expect(findTreeToggle()?.text()).toBe('展开文件树')
+
+    await findTreeToggle().trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    expect(findTreeToggle()?.text()).toBe('收起文件树')
+    expect(wrapper.findAll('.task-file-tree-row').length).toBeGreaterThan(0)
+    expect(wrapper.text()).toContain('01.wav')
+    expect(wrapper.text()).toContain('主插画.png')
+    wrapper.unmount()
+  })
+
+  it('小文件树展开时不采用虚拟器失效坐标', async () => {
+    mocks.virtualizerMode = 'stale'
+    const treeTask = {
+      ...task,
+      details: {
+        metadata: {
+          file_tree_view_kind: 'extracted_snapshot',
+          extracted_file_tree_items: [
+            { relative_path: '目录', name: '目录', type: 'dir' },
+            { relative_path: '目录/01.wav', name: '01.wav', type: 'file', size: 12 },
+          ],
+        },
+      },
+    }
+    mocks.list.mockResolvedValue({ items: [treeTask], total: 1 })
+    mocks.getItem.mockResolvedValue(treeTask)
+    let wrapper
+    try {
+      wrapper = await mountTasksWithDetail()
+      const findTreeToggle = () => wrapper.findAll('button').find(button => (
+        ['展开文件树', '收起文件树'].includes(button.text())
+      ))
+      await findTreeToggle().trigger('click')
+      await flushPromises()
+      await findTreeToggle().trigger('click')
+      await flushPromises()
+      await flushPromises()
+
+      const canvas = wrapper.find('.task-file-tree-virtual-canvas')
+      const canvasHeight = Number.parseFloat(canvas.element.style.height)
+      const rows = wrapper.findAll('.task-file-tree-row')
+      expect(rows.length).toBeGreaterThan(0)
+      for (const row of rows) {
+        const translateY = Number.parseFloat(row.element.style.transform.match(/translateY\(([\d.]+)px\)/)?.[1] || '0')
+        expect(translateY).toBeLessThan(canvasHeight)
+      }
+    } finally {
+      wrapper?.unmount()
+      mocks.virtualizerMode = 'empty'
+    }
+  })
+
   it('虚拟器尚未测量时滚动仍能到达第40项之后', async () => {
     const rows = Array.from({ length: 120 }, (_, index) => ({
       key: `file-${index}`,

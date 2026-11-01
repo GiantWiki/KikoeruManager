@@ -296,6 +296,50 @@ async def test_task_center_item_files_reads_paginated_file_tree_field(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_task_center_item_files_reads_detail_derived_final_tree(monkeypatch, tmp_path):
+    service = TaskCenterService()
+    extracted = tmp_path / "RJ01435183_1"
+    final = tmp_path / "RJ01435183"
+    extracted.mkdir()
+    final.mkdir()
+    (extracted / "解压临时文件.txt").write_text("staging", encoding="utf-8")
+    (final / "01.wav").write_bytes(b"final")
+    task = Task(
+        TaskType.EXTRACT,
+        str(tmp_path / "RJ01435183.7z.001"),
+        task_id="task-derived-final-tree",
+        metadata={
+            "file_tree_items": [{
+                "relative_path": "解压临时文件.txt",
+                "name": "解压临时文件.txt",
+                "type": "file",
+                "size": 7,
+            }],
+            "file_tree_root_path": str(extracted),
+            "file_tree_root_label": extracted.name,
+            "final_output_path": str(final),
+        },
+    )
+    task.complete()
+    engine = Mock()
+    engine.get_task.return_value = task
+    monkeypatch.setattr("app.core.task_center_service.get_task_engine", lambda: engine)
+
+    detail = service._serialize_engine_task(task, mode="detail")
+    assert len(detail["details"]["metadata"]["final_file_tree_items"]) == 1
+    result = await service.get_item_files(
+        item_id="engine:task-derived-final-tree",
+        field="final_file_tree_items",
+        offset=0,
+        limit=200,
+    )
+
+    assert result["total"] == 1
+    assert result["items"][0]["name"] == "01.wav"
+    assert result["has_more"] is False
+
+
+@pytest.mark.asyncio
 async def test_task_center_get_item_reads_single_engine_task(monkeypatch):
     service = TaskCenterService()
     task = Task(TaskType.ASMR_SYNC_DOWNLOAD, "/tmp/source", task_id="task-direct-detail")
