@@ -75,17 +75,32 @@
         </span>
         <span>任务中心</span>
       </button>
+
+      <!-- 插件说明：两个油猴脚本的安装与配置 -->
+      <button
+        type="button"
+        class="dash-cmd-btn group inline-flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border border-slate-200 bg-white px-3.5 text-[13px] font-medium text-slate-700 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-all duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)] hover:-translate-y-0.5 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 active:translate-y-0 active:scale-95 sm:w-auto sm:justify-start"
+        @click="$emit('guide')"
+      >
+        <span class="dash-icon-swap relative inline-flex h-[15px] w-[15px] items-center justify-center">
+          <Puzzle :size="15" :stroke-width="2" class="dash-icon-default text-emerald-500" />
+          <BookOpen :size="15" :stroke-width="2" class="dash-icon-hover text-emerald-600" />
+        </span>
+        <span>插件说明</span>
+      </button>
   </section>
 </template>
 
 <script setup>
 import {
   AlertTriangle,
+  BookOpen,
   ListChecks,
   ListTodo,
   PauseCircle,
   Play,
   PlayCircle,
+  Puzzle,
   Search,
   SearchCheck,
   ShieldAlert,
@@ -97,7 +112,7 @@ defineProps({
   watcherRunning: { type: Boolean, default: false },
 })
 
-defineEmits(['scan', 'toggle-watcher', 'go'])
+defineEmits(['scan', 'toggle-watcher', 'go', 'guide'])
 </script>
 
 <style scoped>

@@ -15,6 +15,7 @@
       @scan="handleManualScan"
       @toggle-watcher="handleWatcherToggle"
       @go="(path) => router.push(path)"
+      @guide="pluginGuideOpen = true"
     />
 
     <main class="grid min-h-0 flex-1 grid-cols-1 items-stretch gap-3 overflow-hidden lg:grid-cols-[minmax(0,1fr)_360px]">
@@ -53,6 +54,8 @@
       />
       </div>
     </main>
+
+    <PluginGuideDialog v-model="pluginGuideOpen" />
   </div>
 </template>
 
@@ -81,6 +84,7 @@ import DashboardCommandStrip from '../components/dashboard/DashboardCommandStrip
 import DashboardActiveTasks from '../components/dashboard/DashboardActiveTasks.vue'
 import DashboardArchive from '../components/dashboard/DashboardArchive.vue'
 import DashboardDeferredQueue from '../components/dashboard/DashboardDeferredQueue.vue'
+import PluginGuideDialog from '../components/dashboard/PluginGuideDialog.vue'
 import { normalizeTaskCenterRealtimePayloads, patchTaskCenterItemListBatch } from '../composables/taskCenterEventUtils'
 import { showSystemConfirm } from '../composables/useSystemPrompt'
 import { useRealtimeEvents } from '../composables/useRealtimeEvents'
@@ -90,6 +94,7 @@ const realtimeEvents = useRealtimeEvents()
 
 const loading = ref(false)
 const scanning = ref(false)
+const pluginGuideOpen = ref(false)
 const watcherRunning = ref(false)
 const taskCenterOverview = ref({
   recent_items: [],

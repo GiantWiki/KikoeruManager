@@ -4,7 +4,7 @@ a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[('app', 'app'), ('../frontend/dist', 'frontend/dist')],
+    datas=[('app', 'app'), ('../frontend/dist', 'frontend/dist'), ('../tampermonkey', 'tampermonkey')],
     hiddenimports=['uvicorn', 'fastapi', 'sqlalchemy', 'yaml', 'watchdog', 'filetype', 'requests', 'aiohttp', 'pystray', 'PIL'],
     hookspath=[],
     hooksconfig={},

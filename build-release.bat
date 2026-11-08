@@ -104,7 +104,7 @@ if errorlevel 1 (
 
 > "%APP_VERSION_FILE%" echo %APP_VERSION%
 
-call "%PYTHON_EXE%" -m PyInstaller --onefile --noconsole --clean --name "%PROJECT_NAME%" --icon "%ICON_ICO%" --distpath "dist" --workpath "build" --specpath "." --paths "%ROOT%" --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image --hidden-import qrcode --hidden-import qrcode.image.pil --hidden-import orjson %UNAR_BIN_ARGS% %REDIS_BIN_ARGS% --add-data "..\frontend\dist;frontend/dist" --add-data "config;backend/config" --add-data "%ICON_PNG%;backend/appIcon.png" --add-data "app\version.txt;backend/app" ..\desktop_app.py
+call "%PYTHON_EXE%" -m PyInstaller --onefile --noconsole --clean --name "%PROJECT_NAME%" --icon "%ICON_ICO%" --distpath "dist" --workpath "build" --specpath "." --paths "%ROOT%" --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image --hidden-import qrcode --hidden-import qrcode.image.pil --hidden-import orjson %UNAR_BIN_ARGS% %REDIS_BIN_ARGS% --add-data "..\frontend\dist;frontend/dist" --add-data "..\tampermonkey;tampermonkey" --add-data "config;backend/config" --add-data "%ICON_PNG%;backend/appIcon.png" --add-data "app\version.txt;backend/app" ..\desktop_app.py
 if errorlevel 1 (
   if exist "%APP_VERSION_FILE%" del /q "%APP_VERSION_FILE%"
   popd

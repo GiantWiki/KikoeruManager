@@ -519,6 +519,11 @@ from .kikoeru_db import router as kikoeru_db_router  # noqa: E402
 
 app.include_router(kikoeru_db_router)
 
+# 内置用户脚本分发（概览页「插件说明」）
+from .userscripts import router as userscripts_router  # noqa: E402
+
+app.include_router(userscripts_router)
+
 # ========== 工具函数 ==========
 def _mask_url_credentials(value: str) -> str:
     text = str(value or "")

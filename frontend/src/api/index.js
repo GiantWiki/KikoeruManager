@@ -1809,6 +1809,13 @@ export const kikoeruApi = {
   }
 }
 
+export const userscriptApi = {
+  list: async () => {
+    const response = await apiClient.get('/userscripts')
+    return response.data
+  }
+}
+
 export const healthApi = {
   check: async () => {
     const response = await apiClient.get('/health')
@@ -3069,6 +3076,7 @@ export default {
   cleanup: cleanupApi,
   pathMapping: pathMappingApi,
   kikoeru: kikoeruApi,
+  userscript: userscriptApi,
   health: healthApi,
   asmrSync: asmrSyncApi,
   httpDownload: httpDownloadApi,

@@ -130,6 +130,8 @@ RUN redis-server --version
 COPY backend/app/ ./app/
 COPY backend/alembic/ ./backend/alembic/
 COPY alembic.ini ./alembic.ini
+# 概览页「插件说明」用：内置油猴脚本及其下载接口
+COPY tampermonkey/ ./tampermonkey/
 COPY docker/entrypoint.sh /usr/local/bin/kikoerumanager-entrypoint
 RUN chmod +x /usr/local/bin/kikoerumanager-entrypoint
 
