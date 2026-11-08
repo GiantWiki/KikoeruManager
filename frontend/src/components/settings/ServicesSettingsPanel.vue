@@ -144,6 +144,7 @@
             </SettingsFieldCard>
           </div>
           <SettingsToggleRow v-model="kikoeruDbConfig.scan_listen_enabled" title="监听 Kikoeru 扫描" subtitle="扫描完成后自动对新入库作品套用文件命名（个别扫描任务失败不阻断）。" />
+          <SettingsToggleRow v-model="kikoeruDbConfig.scan_trigger_enabled" title="入库后定向扫描" subtitle="作品归档落盘后，只扫描它所在的那个媒体库（RJ 区间桶），不做全库重扫；依赖上方监听已连接。" />
           <div v-if="!config.kikoeru_server?.server_url" class="service-result-line">
             提示：监听与 API 写入依赖 Kikoeru 服务器，请先在上方「Kikoeru 服务器查重」中配置地址与账号。
           </div>
@@ -589,6 +590,7 @@ const defaultKikoeruDbConfig = {
   backup_retention: 7,
   snapshot_retention: 20,
   scan_listen_enabled: false,
+  scan_trigger_enabled: true,
   scan_poll_interval_minutes: 30,
   scan_checkpoint: '',
   last_scan_finished_at: ''

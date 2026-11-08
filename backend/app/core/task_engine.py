@@ -2682,6 +2682,32 @@ class TaskEngine:
         except Exception:
             logger.warning("[清理] 删除任务临时解压目录失败: task_id=%s path=%s", task.id, target, exc_info=True)
 
+    def _schedule_kikoeru_bucket_scan(self, task: Task, path: str, rjcode: str) -> None:
+        """归档落盘后触发 Kikoeru 定向扫描（只扫该作品所在的 RJ 桶）。
+
+        只在 ``kikoeru_db.enabled`` 且 ``scan_trigger_enabled`` 时生效；真正的
+        媒体库解析与 ``PERFORM_SCAN`` 发送都在后台任务里做，这里绝不影响主流程。
+        """
+        config = get_config()
+        kb = config.kikoeru_db
+        if not (kb.enabled and kb.scan_trigger_enabled):
+            return
+        target = str(path or "").strip()
+        if not target:
+            return
+        try:
+            from .kikoeru_scan_trigger import get_kikoeru_scan_trigger
+
+            get_kikoeru_scan_trigger().schedule(
+                target,
+                rjcode=str(rjcode or task.rjcode or ""),
+                reason="auto_process",
+            )
+        except Exception:
+            logger.debug(
+                "[%s] 调度 Kikoeru 定向扫描失败", rjcode or "未知", exc_info=True
+            )
+
     async def _finalize_filter_recovery(
         self,
         task: Task,
@@ -3775,6 +3801,10 @@ class TaskEngine:
                     except Exception:
                         logger.warning("[%s] 标准解压入库完成后同步社团拥有态失败 path=%s", rjcode, task.output_path, exc_info=True)
 
+                # 入库完成：只扫作品落地的那个 RJ 桶（Kikoeru 里一个桶就是一个
+                # 媒体库），不做全库重扫。解析与发送都在后台，失败只记日志。
+                self._schedule_kikoeru_bucket_scan(task, task.output_path, rjcode)
+
                 task.update_progress(100, "完成")
                 task.complete()
                 try:
@@ -4134,6 +4164,10 @@ class TaskEngine:
                         )
                     except Exception:
                         logger.warning("[%s] 已有文件夹入库完成后同步社团拥有态失败 path=%s", rjcode, task.output_path, exc_info=True)
+
+                # 入库完成：只扫作品落地的那个 RJ 桶（Kikoeru 里一个桶就是一个
+                # 媒体库），不做全库重扫。解析与发送都在后台，失败只记日志。
+                self._schedule_kikoeru_bucket_scan(task, task.output_path, rjcode)
 
                 task.update_progress(100, "完成")
                 task.complete()

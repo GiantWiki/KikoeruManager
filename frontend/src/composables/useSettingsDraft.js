@@ -220,6 +220,7 @@ export const defaultConfig = {
     backup_retention: 7,
     snapshot_retention: 20,
     scan_listen_enabled: false,
+    scan_trigger_enabled: true,
     scan_poll_interval_minutes: 30,
     scan_checkpoint: '',
     last_scan_finished_at: ''

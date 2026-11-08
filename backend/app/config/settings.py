@@ -312,6 +312,7 @@ class KikoeruDbConfig(BaseModel):
     backup_retention: int = 7             # auto 滚动备份保留份数
     snapshot_retention: int = 20          # 写前回滚快照保留份数（超过或超过 24h 清理）
     scan_listen_enabled: bool = False     # 功能3：socket 监听 Kikoeru 扫描事件
+    scan_trigger_enabled: bool = True     # 功能4：归档入库后只扫落地的那个媒体库（RJ 桶），不全库重扫
     scan_poll_interval_minutes: int = 30  # socket 断线时轮询兜底间隔（分钟）
     scan_checkpoint: str = ""             # 上次已处理的 created_at 检查点（ISO8601，运行中持久化）
     last_scan_finished_at: str = ""       # 最近一次 SCAN_FINISHED 时间（展示用）

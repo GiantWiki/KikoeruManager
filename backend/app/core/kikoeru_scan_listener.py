@@ -4,9 +4,15 @@
 - SCAN_TASKS / SCAN_FAILED_TASKS：仅记日志（个别任务失败**不影响**触发）
 - SCAN_FINISHED：扫描完成 → 对 created_at 晚于检查点的新增作品自动套用文件命名（功能2）
 
+同一条连接还负责**发出**扫描请求（功能4）：``request_scan(["RJ016xxxxx"])``
+即 ``emit("PERFORM_SCAN", {"rootFolders": [...]})``，让入库后只扫落地的那个
+媒体库，不必全库重扫。payload 形态取自 Kikoeru 前端 ``scanPayload()``：
+全选时 ``rootFolders`` 为空数组（=全库），所以本模块拒绝空列表。
+
 兼容性：新版 Kikoeru 前端捆绑 socket.io-client v2（EIO=3 协议），
-因此钉版 python-socketio 4.x + python-engineio 3.x；JWT 通过连接查询串
-`?token=`（socketio-jwt-auth 默认读取位置）与 `Authorization: Bearer` 双通道携带。
+因此钉版 python-socketio 4.x + python-engineio 3.x；JWT 只认连接查询串
+`?auth_token=`（0.6.19 的 socket 鉴权中间件读 ``opts.query.auth_token``），
+同时带 `Authorization: Bearer` 兜底。
 
 断线兜底：socket 不可用时按 scan_poll_interval_minutes 轮询数据库增量，
 重连/恢复后自动补处理，检查点推进保证不重不漏。
@@ -15,6 +21,7 @@
 """
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -48,6 +55,8 @@ class KikoeruScanListener:
         self._had_connection = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._processing = False
+        self._scan_active = False
+        self._last_scan_request_at = ""
 
     # ------------------------------------------------------------ 生命周期
     def _should_run(self) -> bool:
@@ -94,6 +103,56 @@ class KikoeruScanListener:
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def is_scanning(self) -> bool:
+        return self._scan_active
+
+    async def request_scan(
+        self,
+        root_folders: list,
+        reason: str = "",
+        wait_timeout: float = 180.0,
+    ) -> dict:
+        """向 Kikoeru 发 ``PERFORM_SCAN``，只扫指定媒体库。
+
+        ``root_folders`` 是媒体库**名**（不是路径）。空列表在 Kikoeru 里等于
+        「全库扫描」，这里直接拒绝——定向扫描的整个意义就是避免全库重扫。
+        当前正在扫描时先等这一轮结束（上限 ``wait_timeout`` 秒）再发，
+        避免把两个 PERFORM_SCAN 叠在一起。
+        """
+        folders = [str(item or "").strip() for item in (root_folders or [])]
+        folders = [item for item in folders if item]
+        if not folders:
+            return {"started": False, "reason": "未指定媒体库（拒绝全库扫描）"}
+
+        sio = self._sio
+        if not self._connected or sio is None:
+            return {"started": False, "reason": "socket 未连接"}
+
+        waited = 0.0
+        deadline = time.monotonic() + max(float(wait_timeout or 0.0), 0.0)
+        while self._scan_active and time.monotonic() < deadline:
+            await asyncio.sleep(1.5)
+            waited += 1.5
+
+        try:
+            # python-socketio 4.x 的 Client.emit 是同步阻塞的，放到线程里发
+            await asyncio.to_thread(sio.emit, "PERFORM_SCAN", {"rootFolders": folders})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[KIKOERU-SCAN] 发送 PERFORM_SCAN 失败: %s", exc)
+            return {"started": False, "reason": f"emit 失败: {exc}"}
+
+        self._last_scan_request_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            "[KIKOERU-SCAN] 已请求 Kikoeru 定向扫描（%s）: 媒体库=%s%s",
+            reason or "-", "、".join(folders), f"，等待 {int(waited)}s" if waited else "",
+        )
+        return {
+            "started": True,
+            "root_folders": folders,
+            "waited_seconds": int(waited),
+            "requested_at": self._last_scan_request_at,
+        }
 
     # ------------------------------------------------------------ 主循环
     async def _run(self):
@@ -159,10 +218,12 @@ class KikoeruScanListener:
         @sio.on("disconnect")
         def _on_disconnect():  # noqa: ANN001
             self._connected = False
+            self._scan_active = False
             logger.info("[KIKOERU-SCAN] 连接已断开")
 
         @sio.on("SCAN_TASKS")
         def _on_scan_tasks(data):  # noqa: ANN001
+            self._scan_active = True
             try:
                 tasks = (data or {}).get("tasks") or []
                 logger.info("[KIKOERU-SCAN] Kikoeru 开始扫描，任务数=%s", len(tasks))
@@ -180,17 +241,19 @@ class KikoeruScanListener:
 
         @sio.on("SCAN_FINISHED")
         def _on_scan_finished(data):  # noqa: ANN001
+            self._scan_active = False
             logger.info("[KIKOERU-SCAN] 收到 SCAN_FINISHED，开始增量套用文件命名")
             if self._loop is not None:
                 asyncio.run_coroutine_threadsafe(self._process_new_works("scan_finished"), self._loop)
 
         def _socket_blocking():
             try:
-                # EIO=3：token 走查询串（socketio-jwt-auth 默认从 handshake.query.token 取，
-                # 已对真实 0.6.15 实例验证通过），同时带 Authorization 头兜底。
-                # python-socketio 4.x 的 connect 签名无 wait_timeout/extra args。
+                # EIO=3：0.6.19 的 socket.io 鉴权中间件只认查询串里的 auth_token
+                #（前端 App.vue 写的是 ``$socket.io.opts.query.auth_token``）。
+                # 早期这里传 token，服务端一律回 connect_error: No auth token，
+                # 现场日志里从未出现过一次「已连接」。
                 sio.connect(
-                    f"{server}/?token={token}",
+                    f"{server}/?auth_token={token}",
                     headers={"Authorization": f"Bearer {token}"},
                     transports=["websocket", "polling"],
                 )
@@ -201,6 +264,7 @@ class KikoeruScanListener:
                 logger.warning("[KIKOERU-SCAN] socket 连接/等待结束，退避后重试: %s", exc)
             finally:
                 self._connected = False
+                self._scan_active = False
                 try:
                     if sio.connected:
                         sio.disconnect()
