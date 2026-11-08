@@ -124,23 +124,9 @@ class RenameService:
 
         task.update_progress(60, "重命名文件夹")
 
-        # 如果启用了日语元数据，获取日语版本
-        japanese_metadata = None
-        if self.config.rename.use_japanese_metadata:
-            task.update_progress(61, "获取日语元数据")
-            japanese_metadata = await self._get_japanese_metadata(metadata.get('rjcode'))
-            if japanese_metadata:
-                japanese_maker_name = str(japanese_metadata.get('maker_name') or '').strip()
-                if japanese_maker_name:
-                    metadata['classification_maker_name'] = japanese_maker_name
-                    metadata['original_maker_name'] = japanese_maker_name
-
-        # 生成新名称
-        new_name = self._compile_name(metadata, japanese_metadata)
+        # 生成新名称（日语元数据 + 降级保护 + 空段清理都在这里面）
+        new_name = await self.resolve_target_name(metadata, progress=task.update_progress)
         logger.info(f"重命名服务 - 生成的新名称: {new_name}")
-        
-        # 清理非法字符
-        new_name = self._sanitize_filename(new_name)
         
         # 获取目标路径
         dir_path = Path(path)
@@ -177,6 +163,54 @@ class RenameService:
         logger.info(f"重命名: {dir_path} -> {new_path}")
 
         return str(new_path)
+
+    async def resolve_target_name(self, metadata: dict, progress=None) -> str:
+        """按重命名模板算出目标文件夹名（只算名字，不动文件系统）。
+
+        两处兜底与 ``rename`` 共用：
+        - ``metadata_source == 'minimal'`` 时 work_name 是从解压临时目录名猜出来的，
+          可能带 task_id 片段和随机串，不参与渲染，只保留 RJ 号；
+        - 变量为空留下的 ``[]`` / ``【】`` / ``()`` 空段统一清掉，
+          清完什么都不剩时回退 RJ 号，避免产出空目录名。
+        """
+        japanese_metadata = None
+        if self.config.rename.use_japanese_metadata:
+            if callable(progress):
+                progress(61, "获取日语元数据")
+            japanese_metadata = await self._get_japanese_metadata(metadata.get('rjcode'))
+            if japanese_metadata:
+                japanese_maker_name = str(japanese_metadata.get('maker_name') or '').strip()
+                if japanese_maker_name:
+                    metadata['classification_maker_name'] = japanese_maker_name
+                    metadata['original_maker_name'] = japanese_maker_name
+
+        template_metadata = metadata
+        if str(metadata.get('metadata_source') or '').strip().lower() == 'minimal':
+            # 降级元数据的 work_name 是解压目录名残留，绝不能写进库存目录名。
+            template_metadata = {**metadata, 'work_name': ''}
+            logger.warning(
+                "[RENAME] 元数据为降级兜底(minimal)，忽略不可信 work_name，仅按 RJ 号命名: "
+                "rjcode=%s work_name=%s",
+                metadata.get('rjcode'),
+                metadata.get('work_name'),
+            )
+
+        new_name = self._clean_empty_template_segments(
+            self._compile_name(template_metadata, japanese_metadata)
+        )
+        new_name = self._sanitize_filename(new_name)
+        if not new_name.strip(' ._-'):
+            fallback = str(metadata.get('rjcode') or '').strip()
+            logger.warning("[RENAME] 模板渲染结果为空，回退 RJ 号: %s", fallback)
+            new_name = fallback
+        return new_name
+
+    @staticmethod
+    def _clean_empty_template_segments(name: str) -> str:
+        """清掉模板变量为空留下的空括号段，顺带压掉多余空白。"""
+        cleaned = re.sub(r'\[\s*\]|【\s*】|\(\s*\)|（\s*）', '', str(name or ''))
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        return cleaned.strip()
 
     async def _get_japanese_metadata(self, rjcode: str) -> Optional[dict]:
         """

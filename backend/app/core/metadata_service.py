@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 _DLSITE_METADATA_CIRCUIT_FAILURE_THRESHOLD = 3
 _DLSITE_METADATA_CIRCUIT_OPEN_SECONDS = 45.0
+
+# 解压产物目录由 extract_service 用 mkdtemp 生成，形如
+# "<源名主干>_<task_id 前 8 位>_<8 位随机串>"（例：RJ01586348_2_2(RJ01586348)_ba3822b2_jt_yoio4）。
+# 这段随机串永远不是作品名，一旦被当成 work_name，重命名模板会原样写进库存目录。
+_TEMP_EXTRACT_DIR_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}_[a-z0-9_]{6,12}$", re.IGNORECASE)
 _DLSITE_METADATA_CIRCUIT: Dict[str, Any] = {
     "failures": 0,
     "open_until": 0.0,
@@ -609,6 +614,12 @@ class MetadataService:
         metadata.rjcode = rjcode
 
         path_name = os.path.basename(os.path.normpath(path or ''))
+        # normpath('') 会得到 '.'，别把它当成作品名
+        if path_name in ('', '.', os.sep):
+            path_name = ''
+        # path 往往就是解压临时目录，先剥掉 "<task_id8>_<随机串>" 尾巴，
+        # 否则降级出来的 work_name 会带着 task_id 片段进库存。
+        path_name = _TEMP_EXTRACT_DIR_SUFFIX_RE.sub('', path_name)
         display_name = re.sub(r'^[RVB]J(?:\d{6,8})(?!\d)[\s._-]*', '', path_name, flags=re.IGNORECASE)
         display_name = re.sub(r'^\d+\.', '', display_name).strip()
 

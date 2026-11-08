@@ -2956,13 +2956,17 @@ class TaskEngine:
             task.start()
             await self._notify_progress(task)
 
-            if (
-                task.type == TaskType.AUTO_PROCESS
-                and str((task.task_metadata or {}).get("resume_from_stage") or "").strip().lower()
-                == "dlsite_network"
-            ):
-                await self._resume_dlsite_network_task(task, rjcode)
-                return
+            resume_from_stage = str(
+                (task.task_metadata or {}).get("resume_from_stage") or ""
+            ).strip().lower()
+            if task.type == TaskType.AUTO_PROCESS and resume_from_stage == "dlsite_network":
+                if self._dlsite_pause_is_pre_rename(task):
+                    # 上次断网停在重命名之前，产物还是解压临时目录：清掉暂停标记后
+                    # 回落到主流程，由步骤 1 复用该目录、重新取元数据再命名。
+                    self._prepare_pre_rename_resume(task)
+                else:
+                    await self._resume_dlsite_network_task(task, rjcode)
+                    return
 
             if task.type == TaskType.AUTO_PROCESS:
                 from ..config.settings import get_config
@@ -3284,9 +3288,18 @@ class TaskEngine:
                         "清单完成后会自动写缓存"
                     )
 
-                # 步骤1: 解压
+                # 步骤1: 解压（断网续跑时复用上次已解压的产物，不重复解压）
                 logger.info(f"[{rjcode}] 步骤1: 解压")
-                if config.auto_process.extract:
+                pre_rename_resume_path = str(
+                    (task.task_metadata or {}).get("pre_rename_resume_path") or ""
+                ).strip()
+                if pre_rename_resume_path and os.path.isdir(pre_rename_resume_path):
+                    logger.info(
+                        f"[{rjcode}] 续跑复用已解压产物，跳过解压: {pre_rename_resume_path}"
+                    )
+                    task.update_progress(20, "复用已解压产物")
+                    extracted_path = pre_rename_resume_path
+                elif config.auto_process.extract:
                     task.update_progress(10, "解压中")
                     extracted_path = await extract_service.extract(task)
                     logger.info(f"[{rjcode}] 解压结果路径: {extracted_path}")
@@ -3538,6 +3551,29 @@ class TaskEngine:
                         **metadata,
                     }
                     self._sync_task_rjcode(task, metadata.get('rjcode'), source='task_fallback')
+
+                # 元数据是降级兜底（DLsite 不可达 / 短熔断）时不能在此时重命名：
+                # minimal 的 work_name 只是从解压临时目录名猜出来的，写进库存就成了
+                # "[RJ01586348][2_2(RJ...)_<task_id8>_<随机串>]"。断网时不降级命名，
+                # 停在重命名前等人工重试；重试会复用已解压产物继续这一段的后续步骤。
+                # 只在启用了重命名时拦截——关掉重命名时目录名不依赖元数据。
+                if (
+                    config.auto_process.rename
+                    and str(metadata.get("metadata_source") or "").strip().lower() == "minimal"
+                ):
+                    dlsite_network_error = self._dlsite_transport_failure_reason()
+                    if dlsite_network_error:
+                        logger.warning(
+                            f"[{rjcode}] DLsite 元数据网络不可达，暂停在重命名前等待人工重试: "
+                            f"{dlsite_network_error}"
+                        )
+                        self._mark_dlsite_network_paused(
+                            task,
+                            dlsite_network_error,
+                            paused_stage="pre_rename",
+                            resume_path=extracted_path,
+                        )
+                        return
 
                 await task.wait_if_paused()
                 if task.is_cancelled():
@@ -4441,12 +4477,21 @@ class TaskEngine:
             "resume_from_stage",
             "dlsite_network_paused",
             "dlsite_network_error",
+            "dlsite_network_paused_stage",
             "retry_exhausted",
             "retry_exhausted_at",
+            "available_actions",
         ):
             next_metadata.pop(key, None)
         task.task_metadata = next_metadata
         task.error_message = None
+
+        # 旧暂停点的产物可能已经带着降级名进了库存（"[RJ..][2_2(RJ..)_<taskid8>_<随机>]"）。
+        # 这次拿到了可信元数据，顺手在库内改回真名；改名失败不影响后续归档。
+        output_path = await self._rename_paused_output_with_fresh_metadata(
+            task, rjcode, output_path
+        )
+        task.output_path = output_path
 
         config = get_config()
         if config.auto_process.archive and not task.skip_archive:
@@ -4490,13 +4535,77 @@ class TaskEngine:
             logger.warning("[通知] 构建 DLsite 续跑完成 payload 失败", exc_info=True)
         logger.info("[%s] ========== DLsite 暂停点续跑完成 ==========", rjcode)
 
-    def _mark_dlsite_network_paused(self, task: Task, reason: str) -> None:
+    async def _rename_paused_output_with_fresh_metadata(
+        self, task: Task, rjcode: str, output_path: str
+    ) -> str:
+        """旧暂停点续跑：产物已在库存时，用刚拿到的可信元数据把目录名改回来。
+
+        之前断网暂停发生在重命名之后，库存里会留下降级名（"[RJ..][2_2(RJ..)_<taskid8>_<随机>]"）。
+        这里走 ``LibraryManager.rename``，它会同步索引 mutation 并清浏览缓存；
+        任何一步失败都保留原目录，不让改名问题挡住归档。
+        """
+        path = str(output_path or "").strip()
+        if not path or not os.path.isdir(path):
+            return path
+        new_name = ""
+        try:
+            from .library_manager import get_library_manager
+            from .rename_service import RenameService
+
+            manager = get_library_manager()
+            library = manager.find_local_library_for_path(path)
+            if library is None or str(getattr(library, "type", "")) != "local":
+                return path
+
+            source_metadata = dict(task.task_metadata or {})
+            source_metadata["rjcode"] = source_metadata.get("rjcode") or rjcode
+            new_name = await RenameService().resolve_target_name(source_metadata)
+            current_name = os.path.basename(path)
+            if not new_name or new_name == current_name:
+                return path
+
+            result = await manager.rename(library.id, path, new_name)
+            new_path = str((result or {}).get("new_path") or "").strip()
+            if new_path and os.path.isdir(new_path):
+                logger.info(
+                    "[%s] 续跑按最新元数据改回真名: %s -> %s", rjcode, current_name, new_name
+                )
+                return new_path
+            logger.warning(
+                "[%s] 续跑改名未返回有效新路径，保留原目录: %s", rjcode, path
+            )
+            return path
+        except Exception:
+            # os.rename 可能已经成功、只是索引更新报错：新目录存在就按新路径继续，
+            # 否则沿用旧路径，别让 output_path 指向已经不存在的目录。
+            recovered = os.path.join(os.path.dirname(path), new_name) if new_name else ""
+            if recovered and os.path.isdir(recovered):
+                logger.warning(
+                    "[%s] 续跑改名已生效但索引更新报错，按新路径继续: %s", rjcode, recovered
+                )
+                return recovered
+            logger.warning(
+                "[%s] 续跑补名失败，保留原目录名继续归档: %s", rjcode, path, exc_info=True
+            )
+            return path
+
+    def _mark_dlsite_network_paused(
+        self,
+        task: Task,
+        reason: str,
+        *,
+        paused_stage: str = "pre_archive",
+        resume_path: str = "",
+    ) -> None:
         """DLsite 元数据因网络/DNS 不可达时暂停任务，等用户确认网络后手动重试。
 
         形态与 ``_mark_dlsite_linkage_retry_exhausted`` 一致（写问题作品 + 等待人工 +
         可用动作 RETRY/SKIP）；区别是根因在网络，重试前需要用户先确认链路恢复。
+
+        ``paused_stage == "pre_rename"`` 表示产物还停在解压临时目录、尚未命名，
+        重试时应当跳过解压直接复用该目录（见 ``_prepare_pre_rename_resume``）。
         """
-        task.task_metadata = {
+        metadata = {
             **(task.task_metadata or {}),
             "retry_exhausted": True,
             "retry_exhausted_at": datetime.now().isoformat(),
@@ -4504,7 +4613,14 @@ class TaskEngine:
             "resume_from_stage": "dlsite_network",
             "dlsite_network_paused": True,
             "dlsite_network_error": str(reason or "")[:240],
+            "dlsite_network_paused_stage": str(paused_stage or "pre_archive"),
         }
+        normalized_resume_path = str(resume_path or "").strip()
+        if normalized_resume_path:
+            metadata["dlsite_network_resume_path"] = normalized_resume_path
+            # 产物还在临时目录里，必须记进 output_path，否则重试入口会判定产物丢失。
+            task.output_path = normalized_resume_path
+        task.task_metadata = metadata
         try:
             self._record_problem_work_for_task_failure(task, task.rjcode, reason)
         except Exception:
@@ -4513,13 +4629,73 @@ class TaskEngine:
             )
         with task._set_state_silent():
             task.status = TaskStatus.WAITING_MANUAL
-            task.current_step = (
-                "等待人工: DLsite 元数据获取失败（网络/DNS），"
-                "请确认网络或代理恢复正常后点重试继续"
-            )
+            if str(paused_stage or "").strip().lower() == "pre_rename":
+                task.current_step = (
+                    "等待人工: DLsite 元数据获取失败（网络/DNS），产物已解压但未命名，"
+                    "请确认网络或代理恢复后点重试继续"
+                )
+            else:
+                task.current_step = (
+                    "等待人工: DLsite 元数据获取失败（网络/DNS），"
+                    "请确认网络或代理恢复正常后点重试继续"
+                )
             task.completed_at = datetime.now()
         task.mark_changed("status")
         self._remove_waiting_retry_task(task.rjcode)
+
+    @staticmethod
+    def _dlsite_pause_is_pre_rename(task: Task) -> bool:
+        """断网暂停点是否在重命名之前（产物还是解压临时目录，尚未命名/入库）。"""
+        return (
+            str((task.task_metadata or {}).get("dlsite_network_paused_stage") or "")
+            .strip()
+            .lower()
+            == "pre_rename"
+        )
+
+    def _prepare_pre_rename_resume(self, task: Task) -> None:
+        """把"停在重命名前"的断网任务还原成普通任务，复用已解压产物继续跑。"""
+        metadata = dict(task.task_metadata or {})
+        resume_path = str(
+            metadata.get("dlsite_network_resume_path") or task.output_path or ""
+        ).strip()
+        for key in (
+            "resume_from_stage",
+            "dlsite_network_paused",
+            "dlsite_network_error",
+            "dlsite_network_paused_stage",
+            "retry_exhausted",
+            "retry_exhausted_at",
+            "available_actions",
+            "error_message",
+        ):
+            metadata.pop(key, None)
+        resume_ready = bool(resume_path) and os.path.isdir(resume_path)
+        if resume_ready:
+            metadata["pre_rename_resume_path"] = resume_path
+        task.task_metadata = metadata
+        task.error_message = None
+        # 清掉上一轮留下的全局失败快照，否则本轮即使取到元数据也会被判成仍断网。
+        try:
+            from .dlsite_service import clear_dlsite_transport_failure
+
+            clear_dlsite_transport_failure()
+        except Exception:
+            logger.debug(
+                "[%s] 清理 DLsite 传输失败快照失败", task.rjcode or "未知", exc_info=True
+            )
+        if not resume_ready:
+            logger.warning(
+                "[%s] 断网续跑未找到已解压产物，将重新解压: %s",
+                task.rjcode or "未知",
+                resume_path or "未记录",
+            )
+        else:
+            logger.info(
+                "[%s] 从重命名前续跑，复用已解压产物: %s",
+                task.rjcode or "未知",
+                resume_path,
+            )
 
     def _schedule_dlsite_linkage_retry(
         self,
