@@ -6,6 +6,7 @@
 - 写入路由：t_work 的 title/circle_id 优先走 Kikoeru 官方 API（POST /api/edit/work/{id}），
   其余或 API 不可达时自动降级 UNC 直写
 - 备份（activate/auto/manual/snapshot/pre-restore 五类）与恢复
+- 删除带外键预检：r_* 纯关系表先清关联行；其余未声明级联的外键给可读 409
 - 功能2：dir 反解 work_name 后批量/单条套用标题
 
 表权限：
@@ -570,67 +571,194 @@ class KikoeruDbService:
 
         return self._write_with_snapshot(_do)
 
+    # ---- 外键依赖预检（任何表的删除都先查引用方） ----
+    def _fetch_row(self, conn: sqlite3.Connection, table: str, row_id: Any) -> Dict[str, Any]:
+        where, values = self._pk_where(conn, table, row_id)
+        row = conn.execute(f'SELECT * FROM "{table}" WHERE {where}', values).fetchone()
+        return dict(row) if row else {}
+
     @staticmethod
-    def _inspect_track_dependents(conn: sqlite3.Connection, work_id: Any) -> tuple:
-        """检查 t_track 中挂在指定作品下的轨道行（旧版库无此表时返回 0）。
+    def _is_junction_table(conn: sqlite3.Connection, table: str) -> bool:
+        """判断是否为 r_* 纯关系表（主键由外键列组成，如 r_tag_work / r_va_work）。
 
-        返回 ``(轨道行数, 外键 on_delete 动作)``；on_delete 为 None 表示未声明外键，
-        只能提示可能出现孤儿行，不能据此阻断删除。
+        这类行只表达两个实体之间的关联，父行删除后没有任何独立含义，可以在同一
+        事务里先清掉。Kikoeru 建库时 r_tag_work 的两个外键都没写 on delete
+        cascade，不先清就会 FOREIGN KEY constraint failed。
         """
+        if not str(table or "").lower().startswith("r_"):
+            return False
         try:
-            cols = {c["name"] for c in KikoeruDbService._columns_of(conn, "t_track")}
+            cols = {str(c["name"]).lower() for c in KikoeruDbService._columns_of(conn, table)}
+            fk_cols = {
+                str(r["from"]).lower()
+                for r in conn.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()
+            }
+            pk_cols = {str(c).lower() for c in KikoeruDbService._pk_columns(conn, table)}
         except sqlite3.Error:
-            return 0, None
-        if not cols:
-            return 0, None
+            return False
+        if not cols or not fk_cols or len(pk_cols) < 2:
+            return False
+        return pk_cols.issubset(fk_cols) and pk_cols.issubset(cols)
 
-        from_col: Optional[str] = None
-        on_delete: Optional[str] = None
-        try:
-            fk_rows = conn.execute('PRAGMA foreign_key_list("t_track")').fetchall()
-        except sqlite3.Error:
-            fk_rows = []
-        for fk in fk_rows:
-            if str(fk["table"] or "").lower() == "t_work":
-                from_col = str(fk["from"] or "")
-                on_delete = str(fk["on_delete"] or "").upper()
-                break
-        if not from_col:
-            from_col = next((c for c in ("work_id", "workId", "t_work_id") if c in cols), None)
-        if not from_col:
-            return 0, None
+    @staticmethod
+    def _inspect_fk_dependents(
+        conn: sqlite3.Connection, table: str, parent_row: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """列出所有引用 ``table`` 的外键子表，以及命中该行的行数与 on_delete 动作。
 
+        不依赖写死的表名：Kikoeru 升级新增表、旧库缺表都能正确工作；父列取
+        ``PRAGMA foreign_key_list`` 的 ``to``（未声明时按父表主键 seq 对应）。
+        """
+        if not parent_row:
+            return []
+        lowered = {str(k).lower(): v for k, v in parent_row.items()}
+        parent_pk = KikoeruDbService._pk_columns(conn, table)
         try:
-            row = conn.execute(
-                f'SELECT COUNT(*) AS n FROM "t_track" WHERE "{from_col}" = ?', (work_id,)
-            ).fetchone()
+            child_names = [
+                str(r["name"])
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
         except sqlite3.Error:
-            return 0, None
-        return int(row["n"] if row else 0), on_delete
+            return []
+
+        deps: List[Dict[str, Any]] = []
+        for child in child_names:
+            if child.lower() == str(table).lower():
+                continue
+            try:
+                fk_rows = conn.execute(f'PRAGMA foreign_key_list("{child}")').fetchall()
+            except sqlite3.Error:
+                continue
+
+            # 同一 id 的多行是复合外键，必须一起匹配
+            groups: Dict[int, List[sqlite3.Row]] = {}
+            for fk in fk_rows:
+                if str(fk["table"] or "").lower() != str(table).lower():
+                    continue
+                groups.setdefault(int(fk["id"]), []).append(fk)
+
+            for fk_cols in groups.values():
+                fk_cols.sort(key=lambda r: int(r["seq"]))
+                pairs: List[tuple] = []
+                for fk in fk_cols:
+                    from_col = str(fk["from"] or "")
+                    to_col = str(fk["to"] or "")
+                    if not to_col:
+                        idx = int(fk["seq"]) if len(parent_pk) > 1 else 0
+                        to_col = parent_pk[idx] if idx < len(parent_pk) else ""
+                    value = lowered.get(to_col.lower()) if to_col else None
+                    # 外键列含 NULL 时不参与约束，按 SQLite 语义跳过
+                    if not from_col or value is None:
+                        pairs = []
+                        break
+                    pairs.append((from_col, value))
+                if not pairs:
+                    continue
+
+                child_where = " AND ".join([f'"{c}" = ?' for c, _ in pairs])
+                try:
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS n FROM "{child}" WHERE {child_where}',
+                        [v for _, v in pairs],
+                    ).fetchone()
+                except sqlite3.Error:
+                    continue
+                count = int(row["n"] if row else 0)
+                if count <= 0:
+                    continue
+                deps.append(
+                    {
+                        "table": child,
+                        "columns": [c for c, _ in pairs],
+                        "values": [v for _, v in pairs],
+                        "on_delete": str(fk_cols[0]["on_delete"] or "").upper(),
+                        "count": count,
+                        "junction": KikoeruDbService._is_junction_table(conn, child),
+                    }
+                )
+        deps.sort(key=lambda d: (-int(d["count"]), str(d["table"]).lower()))
+        return deps
+
+    @staticmethod
+    def _fk_block_message(table: str, blockers: List[Dict[str, Any]]) -> str:
+        details = []
+        for dep in blockers:
+            cols = "、".join(dep["columns"])
+            action = dep["on_delete"] or "未声明"
+            note = ""
+            if str(dep["table"]).lower() == "t_track":
+                note = "，t_track 为只读表，需先在 Kikoeru 侧移除该作品或手动清理"
+            details.append(f"{dep['table']}.{cols} {dep['count']} 行（ON DELETE {action}{note}）")
+        return (
+            f"无法删除 {table} 的该行：仍有 {len(blockers)} 类关联记录引用它，"
+            "外键不允许级联删除：" + "；".join(details) + "。请先删除或改写这些关联记录后重试。"
+        )
 
     def delete_row(self, table: str, row_id: Any) -> Dict[str, Any]:
         table = self._validate_table(table, need="write")
 
         def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
+            parent_row = self._fetch_row(conn, table, row_id)
             where, values = self._pk_where(conn, table, row_id)
-            related_tracks = 0
-            track_on_delete: Optional[str] = None
-            if table == "t_work" and not isinstance(row_id, dict):
-                related_tracks, track_on_delete = self._inspect_track_dependents(conn, row_id)
-                # 外键明确且不具备级联能力时，删除必然失败：提前给出可读错误
-                if related_tracks and track_on_delete not in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                    raise KikoeruDbError(
-                        f"该作品仍有 {related_tracks} 条 t_track 轨道记录（外键 on_delete={track_on_delete or '未声明'}），"
-                        "请先清理轨道记录后再删除。",
-                        409,
-                    )
-            cur = conn.execute(f'DELETE FROM "{table}" WHERE {where}', values)
+            deps = self._inspect_fk_dependents(conn, table, parent_row)
+
+            cascaded: List[Dict[str, Any]] = []
+            blocking: List[Dict[str, Any]] = []
+            cleanup: List[Dict[str, Any]] = []
+            for dep in deps:
+                # 声明了级联动作的，交给 SQLite 自己处理
+                if dep["on_delete"] in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    continue
+                if dep["junction"]:
+                    cleanup.append(dep)
+                    continue
+                blocking.append(dep)
+            # 先判阻断，避免"清了一半再回滚"的无谓写入
+            if blocking:
+                raise KikoeruDbError(self._fk_block_message(table, blocking), 409)
+            for dep in cleanup:
+                child_where = " AND ".join([f'"{c}" = ?' for c in dep["columns"]])
+                child_cur = conn.execute(
+                    f'DELETE FROM "{dep["table"]}" WHERE {child_where}', dep["values"]
+                )
+                cascaded.append(
+                    {
+                        "table": dep["table"],
+                        "columns": dep["columns"],
+                        "deleted": int(child_cur.rowcount or 0),
+                    }
+                )
+
+            try:
+                cur = conn.execute(f'DELETE FROM "{table}" WHERE {where}', values)
+            except sqlite3.IntegrityError as exc:
+                if "foreign key" not in str(exc).lower():
+                    raise
+                # 预检没覆盖到的引用（升级新增表、父列名缺失等）回查后给可读结论
+                late = [
+                    d
+                    for d in self._inspect_fk_dependents(conn, table, parent_row)
+                    if d["on_delete"] not in ("CASCADE", "SET NULL", "SET DEFAULT")
+                ]
+                if late:
+                    raise KikoeruDbError(self._fk_block_message(table, late), 409) from exc
+                raise KikoeruDbError(
+                    f"无法删除 {table} 的该行：仍被其他表的外键引用（SQLite: {exc}）", 409
+                ) from exc
+
             if cur.rowcount == 0:
                 raise KikoeruDbError("未找到目标行", 404)
             result: Dict[str, Any] = {"table": table, "deleted": cur.rowcount}
+            if cascaded:
+                result["cascaded"] = cascaded
             if table == "t_work":
-                result["related_tracks"] = related_tracks
-                result["track_on_delete"] = track_on_delete
+                track_dep = next(
+                    (d for d in deps if str(d["table"]).lower() == "t_track"), None
+                )
+                result["related_tracks"] = int(track_dep["count"]) if track_dep else 0
+                result["track_on_delete"] = track_dep["on_delete"] if track_dep else None
                 result["cache_note"] = "Kikoeru 音频缓存按作品归档且不再自动淘汰，删除作品不会清理已缓存文件。"
             return result
 

@@ -1108,6 +1108,7 @@ async function deleteSelected() {
   let ok = 0
   let relatedTracks = 0
   let cacheNote = ''
+  const cascadedCounts = {}
   for (const row of selectedRows.value) {
     try {
       const id = pkCols.length > 1
@@ -1116,6 +1117,9 @@ async function deleteSelected() {
       const result = await kikoeruDbApi.deleteRow(activeTable.value, id)
       ok += 1
       relatedTracks += Number(result?.related_tracks || 0)
+      for (const item of result?.cascaded || []) {
+        cascadedCounts[item.table] = (cascadedCounts[item.table] || 0) + Number(item.deleted || 0)
+      }
       if (result?.cache_note) cacheNote = result.cache_note
     } catch (error) {
       ElMessage.error(apiErrorDetail(error, `删除行失败: ${JSON.stringify(row).slice(0, 60)}`))
@@ -1124,6 +1128,11 @@ async function deleteSelected() {
   if (ok > 0) {
     let message = `已删除 ${ok} 行`
     if (relatedTracks > 0) message += `；关联 t_track 轨道 ${relatedTracks} 条`
+    const cascadedText = Object.entries(cascadedCounts)
+      .filter(([, count]) => count > 0)
+      .map(([table, count]) => `${table} ${count} 行`)
+      .join('、')
+    if (cascadedText) message += `；同时清理关联 ${cascadedText}`
     ElMessage.success(message)
     if (cacheNote) ElMessage.warning(cacheNote)
     await loadRows()
