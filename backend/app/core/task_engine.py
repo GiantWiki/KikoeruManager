@@ -2687,15 +2687,23 @@ class TaskEngine:
 
         只在 ``kikoeru_db.enabled`` 且 ``scan_trigger_enabled`` 时生效；真正的
         媒体库解析与 ``PERFORM_SCAN`` 发送都在后台任务里做，这里绝不影响主流程。
+
+        v2.6.70 回归教训：本模块没有模块级 ``get_config`` 导入（全项目约定都是
+        函数体内 ``from ..config.settings import get_config``）。当时漏了这行，
+        在作品已经归档入库、社团补全也写完之后抛 NameError，任务被判定失败，
+        连带 ``_cleanup_failed_task`` 把刚入库的 2GB 成品目录删掉。所以这里必须
+        整段包 try，且异常只记 debug——收尾阶段的任何副作用都不能反噬主流程。
         """
-        config = get_config()
-        kb = config.kikoeru_db
-        if not (kb.enabled and kb.scan_trigger_enabled):
-            return
-        target = str(path or "").strip()
-        if not target:
-            return
         try:
+            from ..config.settings import get_config
+
+            config = get_config()
+            kb = config.kikoeru_db
+            if not (kb.enabled and kb.scan_trigger_enabled):
+                return
+            target = str(path or "").strip()
+            if not target:
+                return
             from .kikoeru_scan_trigger import get_kikoeru_scan_trigger
 
             get_kikoeru_scan_trigger().schedule(
@@ -5739,6 +5747,24 @@ class TaskEngine:
         }
         return subtask_ids
 
+    def _failed_output_path_inside_library(self, path: str) -> bool:
+        """失败清理用：output_path 是否已经落在本地库存根下。
+
+        返回 True 只表示「不要整目录删除」。判断不出来时也返回 True——
+        删掉一个已经入库的成品（用户要重新下载几个 GB）远比留下一个待人工
+        确认的目录昂贵。
+        """
+        target = str(path or "").strip()
+        if not target:
+            return False
+        try:
+            from .library_manager import get_library_manager
+
+            return get_library_manager().find_local_library_for_path(target) is not None
+        except Exception:
+            logger.debug("[清理] 判断失败产物是否已在库存内出错: %s", target, exc_info=True)
+            return True
+
     async def _cleanup_failed_task(self, task: Task):
         """清理失败任务产生的临时文件"""
         from ..config.settings import get_config
@@ -5839,13 +5865,22 @@ class TaskEngine:
             return
         
         # 1. 清理 output_path（如果已设置）- 只针对失败的任务
+        #    已入库的成品不能删：v2.6.70 的 get_config NameError 就是在归档入库、
+        #    社团补全都写完之后抛的，任务被判失败并把刚入库的 2GB 目录删了，
+        #    重试要重新下载整个包。保留目录最多让用户手动收拾，代价小得多。
         if task.status == TaskStatus.FAILED and task.output_path and os.path.exists(task.output_path):
-            try:
-                await asyncio.to_thread(shutil.rmtree, task.output_path)
-                cleaned_paths.append(task.output_path)
-                logger.info(f"清理失败任务缓存: {task.output_path}")
-            except Exception as e:
-                logger.warning(f"清理失败任务缓存失败: {task.output_path}, {e}")
+            if self._failed_output_path_inside_library(task.output_path):
+                logger.warning(
+                    "失败任务产物已落在库存内，跳过删除（保留给人工确认或重试复用）: %s",
+                    task.output_path,
+                )
+            else:
+                try:
+                    await asyncio.to_thread(shutil.rmtree, task.output_path)
+                    cleaned_paths.append(task.output_path)
+                    logger.info(f"清理失败任务缓存: {task.output_path}")
+                except Exception as e:
+                    logger.warning(f"清理失败任务缓存失败: {task.output_path}, {e}")
         
         # 2. 如果是自动处理流程，检查并清理temp目录下所有可能的残留
         if task.type == TaskType.AUTO_PROCESS and task.source_path:
