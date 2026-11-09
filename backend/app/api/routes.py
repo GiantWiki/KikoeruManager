@@ -15575,6 +15575,38 @@ async def get_real_library_status():
         raise HTTPException(status_code=500, detail=f"获取真库存状态失败: {str(e)}")
 
 
+def _rjcode_from_work_path(path: str) -> str:
+    """从作品目录名里取 RJ 号（``[RJ01692977][标题]`` -> ``RJ01692977``）。"""
+    match = re.match(r"\[?(RJ\d{6,8})", os.path.basename(str(path or "")), re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def _trigger_kikoeru_scan_after_move(moved) -> None:
+    """移库落盘后触发 Kikoeru 定向扫描。
+
+    暂存库不在 Kikoeru 的媒体库里，入库完成时扫描没有意义；作品真正进真库存
+    的那一刻才是要扫的时机。一批移库会被触发器的防抖窗口合并成一次扫描。
+    """
+    items = list(moved or [])
+    if not items:
+        return
+    try:
+        from ..core.kikoeru_scan_trigger import get_kikoeru_scan_trigger
+
+        trigger = get_kikoeru_scan_trigger()
+    except Exception:
+        logger.debug("[移库] 定向扫描初始化失败", exc_info=True)
+        return
+    for item in items:
+        target = str((item or {}).get("target") or "").strip()
+        if not target:
+            continue
+        try:
+            trigger.schedule(target, rjcode=_rjcode_from_work_path(target), reason="move_to_real")
+        except Exception:
+            logger.debug("[移库] 调度定向扫描失败: %s", target, exc_info=True)
+
+
 @app.post("/api/library/move-to-real")
 async def move_to_real_library(request: Request):
     """将暂存库中的文件/文件夹移动到真库存
@@ -15673,6 +15705,7 @@ async def move_to_real_library(request: Request):
                 f"[移库] 完成: 移动 {len(results['moved'])} 项, "
                 f"跳过 {len(results['skipped'])} 项, 失败 {len(results['failed'])} 项"
             )
+            _trigger_kikoeru_scan_after_move(results["moved"])
         return results
 
     except HTTPException:

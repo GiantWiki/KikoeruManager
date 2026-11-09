@@ -2683,10 +2683,13 @@ class TaskEngine:
             logger.warning("[清理] 删除任务临时解压目录失败: task_id=%s path=%s", task.id, target, exc_info=True)
 
     def _schedule_kikoeru_bucket_scan(self, task: Task, path: str, rjcode: str) -> None:
-        """归档落盘后触发 Kikoeru 定向扫描（只扫该作品所在的 RJ 桶）。
+        """归档落盘后尝试触发 Kikoeru 定向扫描（只扫该作品所在的 RJ 桶）。
 
         只在 ``kikoeru_db.enabled`` 且 ``scan_trigger_enabled`` 时生效；真正的
         媒体库解析与 ``PERFORM_SCAN`` 发送都在后台任务里做，这里绝不影响主流程。
+        作品落在暂存库（``storage.library_path``）时触发器会自行跳过——Kikoeru
+        的媒体库是真库存，要等「一键移库」搬进去之后才扫得到，那次由移库接口
+        负责触发。
 
         v2.6.70 回归教训：本模块没有模块级 ``get_config`` 导入（全项目约定都是
         函数体内 ``from ..config.settings import get_config``）。当时漏了这行，

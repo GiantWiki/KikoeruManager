@@ -10,9 +10,14 @@ Kikoeru 里正好被注册成一个独立媒体库。所以作品落盘后只需
 
 解析顺序（都对 ``/api/config/admin`` 的 ``rootFolders`` 求值）：
 
+0. **暂存库拦截**：作品还在默认解压库存（``storage.library_path``，通常是
+   ``/library``）里时，Kikoeru 的媒体库根本看不到它，直接跳过并记日志；
+   「一键移库」把作品搬进真库存后会再触发一次。
 1. **落盘路径**：把作品父目录的尾部片段与媒体库 ``path`` 的尾部片段做最长匹配。
    容器里的 ``/usr/src/kikoeru/VoiceWork/汉化/RJ016xxxxx`` 与本机看到的
    ``/汉化/RJ016xxxxx`` 前缀不同，但尾部 ``汉化/RJ016xxxxx`` 是一致的。
+   只有命中 **两段以上** 才算数，避免暂存库的 ``RJ016xxxxx`` 与真库存的
+   ``汉化/RJ016xxxxx`` 因共用桶名一段而误判。
 2. **RJ 号模式**：路径匹配不到时，用媒体库名 ``RJ016xxxxx`` 的位数模式反推
    （前缀位数 + x 位数必须与 RJ 号总位数一致，且唯一命中）。
 3. 两者都不中 → 放弃并记日志，**绝不回退成全库扫描**（全库扫描正是要避免的代价）。
@@ -22,6 +27,7 @@ Kikoeru 里正好被注册成一个独立媒体库。所以作品落盘后只需
 """
 import asyncio
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -32,10 +38,21 @@ logger = logging.getLogger(__name__)
 
 # 媒体库列表缓存时长：Kikoeru 改媒体库不频繁，避免每次入库都打一次 HTTP
 _ROOT_CACHE_TTL_SECONDS = 300.0
-# 合并窗口：同一批入库落盘时间可能相差几秒到十几秒
-_DEBOUNCE_SECONDS = 15.0
+# 合并窗口：同一批入库/移库落盘时间可能相差几秒到十几秒，一次移库也可能
+# 搬几十个作品；30s 把这一批合并成一次扫描。
+_DEBOUNCE_SECONDS = 30.0
+# 路径匹配至少命中媒体库路径的几段才算「作品真的在这个媒体库里」。
+# 暂存库 /library/RJ016xxxxx 与真库存 .../汉化/RJ016xxxxx 只共用桶名一段，
+# 只命中一段时必须当作「不在媒体库内」，否则会扫一个 Kikoeru 看不到的目录。
+_MIN_PATH_MATCH_DEPTH = 2
 # 等当前扫描结束的上限，超时后仍然发（Kikoeru 侧会排队）
 _SCAN_BUSY_WAIT_SECONDS = 180.0
+# 扫描后校验：第一次检查前等待的时间（大库扫描本身要几十秒）
+_VERIFY_DELAY_SECONDS = 90.0
+# 校验发现未入库时的重发间隔
+_VERIFY_RETRY_INTERVAL_SECONDS = 90.0
+# 最多校验轮数（首发 + 2 次重发）
+_VERIFY_MAX_ATTEMPTS = 3
 
 _RJ_CODE_RE = re.compile(r"^(R?V?J)(\d+)$", re.IGNORECASE)
 _RJ_BUCKET_RE = re.compile(r"^(R?V?J)(\d+)(x+)$", re.IGNORECASE)
@@ -45,6 +62,21 @@ def _split_segments(path: Any) -> List[str]:
     """把 POSIX / Windows 路径统一拆成非空片段。"""
     raw = str(path or "").strip().replace("\\", "/")
     return [seg for seg in raw.split("/") if seg]
+
+
+def _is_inside(path: Any, root: Any) -> bool:
+    """``path`` 是否等于 ``root`` 或位于 ``root`` 之下（忽略大小写与分隔符差异）。"""
+    root_text = str(root or "").strip()
+    if not root_text:
+        return False
+    try:
+        target = os.path.normcase(os.path.normpath(str(path or "").strip()))
+        base = os.path.normcase(os.path.normpath(root_text))
+    except (OSError, ValueError):
+        return False
+    if not target or not base:
+        return False
+    return target == base or target.startswith(base.rstrip(os.sep) + os.sep)
 
 
 class KikoeruScanTrigger:
@@ -86,7 +118,33 @@ class KikoeruScanTrigger:
         kb = get_config().kikoeru_db
         if not (kb.enabled and kb.scan_trigger_enabled):
             return {"queued": False, "reason": "disabled", "root_folder": ""}
-        name = await self.resolve_root_folder(path, rjcode)
+        if not str(path or "").strip():
+            return {"queued": False, "reason": "empty_path", "root_folder": ""}
+        roots = await self._load_roots()
+        name, depth = self._path_match_detail(path, roots)
+        if not (name and depth >= _MIN_PATH_MATCH_DEPTH):
+            # 只命中桶名一段：最常见的是作品还在暂存库（/library/RJ016xxxxx），
+            # 而 Kikoeru 的媒体库是真库存（.../汉化/RJ016xxxxx）。此时扫了也没用，
+            # 等「一键移库」把作品搬进真库存后会再触发一次。
+            staging = self._staging_root()
+            if staging and _is_inside(path, staging):
+                logger.info(
+                    "[KIKOERU-SCAN] 作品还在暂存库，Kikoeru 扫不到，跳过定向扫描"
+                    "（移库后会再触发）: path=%s 暂存库=%s",
+                    path,
+                    staging,
+                )
+                return {
+                    "queued": False,
+                    "reason": "staging_library",
+                    "root_folder": name or "",
+                }
+            if not name:
+                name = self.resolve_by_rjcode(rjcode, roots)
+                if name:
+                    logger.info(
+                        "[KIKOERU-SCAN] 路径匹配失败，按 RJ 号反推媒体库: rj=%s -> %s", rjcode, name
+                    )
         if not name:
             logger.info(
                 "[KIKOERU-SCAN] 作品路径未匹配到 Kikoeru 媒体库，跳过定向扫描: path=%s rj=%s",
@@ -96,6 +154,14 @@ class KikoeruScanTrigger:
         self._pending[name] = rjcode or name
         self._ensure_worker()
         return {"queued": True, "root_folder": name, "rjcode": rjcode}
+
+    @staticmethod
+    def _staging_root() -> str:
+        """暂存库（默认解压库存）根路径；Kikoeru 未注册它时不能在里面触发扫描。"""
+        try:
+            return str(getattr(get_config().storage, "library_path", "") or "").strip()
+        except Exception:
+            return ""
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -154,11 +220,15 @@ class KikoeruScanTrigger:
         return self._roots_cache
 
     @staticmethod
-    def resolve_by_path(path: str, roots: List[Dict[str, Any]]) -> Optional[str]:
-        """按落盘路径的尾部片段与媒体库路径做最长后缀匹配。"""
+    def _path_match_detail(path: str, roots: List[Dict[str, Any]]) -> tuple:
+        """按落盘路径的尾部片段与媒体库路径做最长后缀匹配。
+
+        返回 ``(媒体库名, 命中段数)``。命中段数是判断「作品是否真的在媒体库里」
+        的依据：暂存库的 ``RJ016xxxxx`` 与真库存的 ``汉化/RJ016xxxxx`` 只共用一段。
+        """
         parent = _split_segments(path)[:-1]
         if not parent:
-            return None
+            return None, 0
         best_depth = 0
         best_name: Optional[str] = None
         ambiguous = False
@@ -183,8 +253,14 @@ class KikoeruScanTrigger:
                 ambiguous = True
         if ambiguous:
             logger.info("[KIKOERU-SCAN] 路径 %s 命中多个同等深度的媒体库，放弃猜测", path)
-            return None
-        return best_name
+            return None, 0
+        return best_name, best_depth
+
+    @staticmethod
+    def resolve_by_path(path: str, roots: List[Dict[str, Any]]) -> Optional[str]:
+        """按落盘路径的尾部片段与媒体库路径做最长后缀匹配。"""
+        name, _depth = KikoeruScanTrigger._path_match_detail(path, roots)
+        return name
 
     @staticmethod
     def resolve_by_rjcode(rjcode: str, roots: List[Dict[str, Any]]) -> Optional[str]:
@@ -217,6 +293,10 @@ class KikoeruScanTrigger:
         return candidates[0][1]
 
     async def resolve_root_folder(self, path: str, rjcode: str = "") -> Optional[str]:
+        """只回答「这条路径属于哪个媒体库」，不做暂存库拦截。
+
+        真正的触发走 :meth:`trigger_for_path`，那里会额外判断作品是否还在暂存库。
+        """
         roots = await self._load_roots()
         if not roots:
             return None
@@ -248,7 +328,7 @@ class KikoeruScanTrigger:
 
     async def _flush_loop(self) -> None:
         try:
-            # 合并窗口：等一批入库都落盘后再一次性发
+            # 合并窗口：等一批入库/移库都落盘后再一次性发
             await asyncio.sleep(_DEBOUNCE_SECONDS)
             from .kikoeru_scan_listener import get_kikoeru_scan_listener
 
@@ -275,6 +355,9 @@ class KikoeruScanTrigger:
                     "、".join(targets),
                     "、".join(works.values()),
                 )
+                # 单次 PERFORM_SCAN 不保证一定收录（元数据抓取失败、扫描排队被
+                # 打断等），这里在扫描后回查 t_work，缺作品就隔一会儿重发。
+                self._spawn_verify(targets, works)
             else:
                 logger.info(
                     "[KIKOERU-SCAN] 入库定向扫描未发出（%s）: %s",
@@ -287,6 +370,115 @@ class KikoeruScanTrigger:
             self._worker = None
             if self._pending:
                 self._ensure_worker()
+
+    # ------------------------------------------------------------ 扫描后校验
+    def _spawn_verify(self, targets: List[str], works: Dict[str, str]) -> None:
+        if not works:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._verify_scan_result(targets, dict(works)))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _verify_scan_result(
+        self,
+        targets: List[str],
+        works: Dict[str, str],
+        attempt: int = 1,
+    ) -> None:
+        """扫描后回查 t_work：目标作品没进库就重发，最多 ``_VERIFY_MAX_ATTEMPTS`` 轮。"""
+        try:
+            await asyncio.sleep(_VERIFY_DELAY_SECONDS)
+            missing = await self._missing_rj_ids(list(works.values()))
+            if not missing:
+                logger.info(
+                    "[KIKOERU-SCAN] 定向扫描校验通过: 媒体库=%s 作品=%s 均已入库",
+                    "、".join(targets),
+                    "、".join(works.values()),
+                )
+                return
+            if attempt >= _VERIFY_MAX_ATTEMPTS:
+                logger.warning(
+                    "[KIKOERU-SCAN] 定向扫描重试 %s 轮后作品仍未入库，请手动扫描该媒体库: "
+                    "媒体库=%s 缺失=%s",
+                    attempt,
+                    "、".join(targets),
+                    "、".join(missing),
+                )
+                self._last_result = {
+                    **(self._last_result or {}),
+                    "verified": False,
+                    "missing_works": missing,
+                }
+                return
+            logger.info(
+                "[KIKOERU-SCAN] 定向扫描后仍有作品未入库，%.0fs 后重发（第 %s 轮）: 媒体库=%s 作品=%s",
+                _VERIFY_RETRY_INTERVAL_SECONDS,
+                attempt + 1,
+                "、".join(targets),
+                "、".join(missing),
+            )
+            await asyncio.sleep(_VERIFY_RETRY_INTERVAL_SECONDS)
+            from .kikoeru_scan_listener import get_kikoeru_scan_listener
+
+            listener = get_kikoeru_scan_listener()
+            if not listener.is_connected():
+                logger.info(
+                    "[KIKOERU-SCAN] 补扫未执行：socket 未连接（媒体库 %s）",
+                    "、".join(targets),
+                )
+                return
+            result = await listener.request_scan(
+                targets, reason=f"verify_retry{attempt}", wait_timeout=_SCAN_BUSY_WAIT_SECONDS
+            )
+            if result.get("started"):
+                await self._verify_scan_result(targets, works, attempt + 1)
+            else:
+                logger.info(
+                    "[KIKOERU-SCAN] 补扫未发出（%s）: %s",
+                    result.get("reason") or "未知原因",
+                    "、".join(targets),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[KIKOERU-SCAN] 扫描结果校验异常", exc_info=True)
+
+    @staticmethod
+    async def _missing_rj_ids(rjcodes: List[str]) -> List[str]:
+        """返回 t_work 里还查不到的 RJ 号（查询失败时返回空，不做补扫）。"""
+        pairs = []
+        for code in rjcodes or []:
+            match = _RJ_CODE_RE.match(str(code or "").strip())
+            if match:
+                pairs.append((str(code).strip(), int(match.group(2))))
+        if not pairs:
+            return []
+        try:
+            from .kikoeru_db_service import get_kikoeru_db_service
+
+            service = get_kikoeru_db_service()
+
+            def _query() -> set:
+                conn = service._connect(None, readonly=True)
+                try:
+                    marks = ",".join("?" * len(pairs))
+                    cursor = conn.execute(
+                        f'SELECT id FROM "t_work" WHERE id IN ({marks})',
+                        [work_id for _, work_id in pairs],
+                    )
+                    return {int(row["id"]) for row in cursor.fetchall()}
+                finally:
+                    conn.close()
+
+            found = await asyncio.to_thread(_query)
+        except Exception:
+            logger.debug("[KIKOERU-SCAN] 校验扫描结果时读取数据库失败，跳过补扫", exc_info=True)
+            return []
+        return [code for code, work_id in pairs if work_id not in found]
 
 
 _trigger: Optional[KikoeruScanTrigger] = None

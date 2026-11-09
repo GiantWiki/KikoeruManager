@@ -57,6 +57,11 @@ class KikoeruScanListener:
         self._processing = False
         self._scan_active = False
         self._last_scan_request_at = ""
+        # SCAN_MAIN_LOGS 是累计数组，按文本去重后每轮扫描只记一次关键统计行
+        self._logged_main_lines: set = set()
+
+    def _reset_main_log_dedup(self) -> None:
+        self._logged_main_lines = set()
 
     # ------------------------------------------------------------ 生命周期
     def _should_run(self) -> bool:
@@ -136,6 +141,8 @@ class KikoeruScanListener:
             waited += 1.5
 
         try:
+            # 新的一轮扫描：清空累计日志去重表，保证本轮统计行能打出来
+            self._reset_main_log_dedup()
             # python-socketio 4.x 的 Client.emit 是同步阻塞的，放到线程里发
             await asyncio.to_thread(sio.emit, "PERFORM_SCAN", {"rootFolders": folders})
         except Exception as exc:  # noqa: BLE001
@@ -239,10 +246,32 @@ class KikoeruScanListener:
             except Exception:
                 logger.debug("[KIKOERU-SCAN] SCAN_FAILED_TASKS payload 解析失败", exc_info=True)
 
+        @sio.on("SCAN_MAIN_LOGS")
+        def _on_scan_main_logs(data):  # noqa: ANN001
+            # 只挑关键统计行入日志：扫描范围与「共找到 N 个」，用于判断
+            # Kikoeru 到底看没看到本次落盘的目录。Kikoeru 每次推的是**累计**
+            # 数组，同一条会反复出现，所以按文本去重，一轮扫描只记一次。
+            try:
+                for item in (data or {}).get("mainLogs") or []:
+                    message = str((item or {}).get("message") or "").strip()
+                    if not message or message in self._logged_main_lines:
+                        continue
+                    if "扫描范围" not in message and "共找到" not in message:
+                        continue
+                    self._logged_main_lines.add(message)
+                    logger.info("[KIKOERU-SCAN] Kikoeru: %s", message)
+            except Exception:
+                logger.debug("[KIKOERU-SCAN] SCAN_MAIN_LOGS payload 解析失败", exc_info=True)
+
         @sio.on("SCAN_FINISHED")
         def _on_scan_finished(data):  # noqa: ANN001
             self._scan_active = False
-            logger.info("[KIKOERU-SCAN] 收到 SCAN_FINISHED，开始增量套用文件命名")
+            message = str((data or {}).get("message") or "").strip()
+            logger.info(
+                "[KIKOERU-SCAN] 收到 SCAN_FINISHED%s，开始增量套用文件命名",
+                f": {message}" if message else "",
+            )
+            self._logged_main_lines.clear()
             if self._loop is not None:
                 asyncio.run_coroutine_threadsafe(self._process_new_works("scan_finished"), self._loop)
 
