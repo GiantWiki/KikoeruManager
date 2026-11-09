@@ -31,6 +31,19 @@ SCRUB_INTERVAL_SECONDS = 300.0
 SCRUB_MAX_DIRECTORIES = 200
 SCRUB_MAX_SECONDS = 2.0
 GENERATION_RECOVERY_DEBOUNCE_SECONDS = 5.0
+# 这些阻塞是「另一次重建还在进行中」的短暂状态，会随对方结束或心跳超时自愈，
+# 不值得每 5 秒打一份完整 traceback。
+_TRANSIENT_GENERATION_BLOCK_MARKERS = (
+    "已有 building generation",
+    "有 prepared mutation",
+)
+
+
+def _is_transient_generation_block(error: BaseException) -> bool:
+    message = str(error or "")
+    return any(marker in message for marker in _TRANSIENT_GENERATION_BLOCK_MARKERS)
+
+
 # 下载抑制：路径带活跃 aria2 控制文件（*.aria2）时说明文件仍在写入，
 # 此时 reconcile 拿到的大小立刻就过期，只会白扫一遍 + 刷屏日志。
 # 跳过即可——aria2 下载完成会删掉 .aria2，那个 delete 事件会重新触发
@@ -579,12 +592,23 @@ class LibraryIndexWatcherDriver:
                     library_id,
                     reason,
                 )
-            except Exception:
-                logger.exception(
-                    "[索引 watcher] generation recovery 失败 library=%s reason=%s",
-                    library_id,
-                    reason,
-                )
+            except Exception as exc:
+                # 「已有 building generation / prepared mutation」是可自愈的短暂阻塞：
+                # 之前每次重试都打完整 traceback，日志 5 秒一条刷了几万行。
+                if _is_transient_generation_block(exc):
+                    logger.info(
+                        "[索引 watcher] generation recovery 暂时受阻，稍后重试 "
+                        "library=%s reason=%s detail=%s",
+                        library_id,
+                        reason,
+                        exc,
+                    )
+                else:
+                    logger.exception(
+                        "[索引 watcher] generation recovery 失败 library=%s reason=%s",
+                        library_id,
+                        reason,
+                    )
                 with self._lock:
                     self._generation_recovery_requested[library_id] = (
                         reason,

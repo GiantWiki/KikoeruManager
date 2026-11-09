@@ -2515,6 +2515,32 @@ async def _periodic_task_phase_metric_cleanup():
         await asyncio.sleep(24 * 3600)
 
 
+# 持住引用，避免 create_task 的延迟补扫任务被 GC 掉。
+_deferred_orphan_sweep_task = None
+
+
+async def _deferred_orphan_build_sweep() -> None:
+    """启动补扫：重启距上次构建不足宽限期时，再等一个宽限期回收孤儿标记。
+
+    ``recover_orphaned_building_generations`` 为了不误伤并发实例上的重建，
+    要求心跳停滞满一个宽限期才动手。进程刚好在构建中断后几秒内重启时，
+    启动那一刻还判不出来，这里补一次，避免这次重启把重建永久卡住。
+    """
+    from ..core.library_index.service import BUILDING_GENERATION_ORPHAN_GRACE_SECONDS
+
+    await asyncio.sleep(BUILDING_GENERATION_ORPHAN_GRACE_SECONDS + 30)
+    try:
+        recovered = await asyncio.to_thread(
+            get_library_index_service().recover_orphaned_building_generations
+        )
+        if recovered:
+            logger.warning("[启动] 补扫回收中断的索引重建: %s", recovered)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("[启动] 补扫回收中断的索引重建失败", exc_info=True)
+
+
 async def _periodic_library_index_maintenance():
     config = _library_index_maintenance_config()
     await asyncio.sleep(config.pop("initial_delay_seconds"))
@@ -2587,6 +2613,25 @@ async def startup_event():
         get_library_index_service().normalize_all_interrupted_syncing_statuses()
     except Exception:
         logger.warning("[启动] 纠正库存索引同步状态失败", exc_info=True)
+    # 重建途中被重启会留下 building generation 标记，不清掉的话重建永远起不来
+    # （watcher 会每 5 秒失败重试一次，日志被刷满且库存索引永久停更）。
+    try:
+        recovered_builds = get_library_index_service().recover_orphaned_building_generations()
+        if recovered_builds:
+            logger.warning(
+                "[启动] 回收中断的索引重建 %s 个: %s",
+                len(recovered_builds),
+                ", ".join(
+                    f"{item['library_id']}#{item['generation']}"
+                    for item in recovered_builds
+                ),
+            )
+    except Exception:
+        logger.warning("[启动] 回收中断的索引重建失败", exc_info=True)
+    else:
+        # 重启距上次构建太近时上面的扫描会保守跳过，补一次延后扫描。
+        global _deferred_orphan_sweep_task
+        _deferred_orphan_sweep_task = asyncio.create_task(_deferred_orphan_build_sweep())
     try:
         start_library_index_mutation_service()
     except Exception:

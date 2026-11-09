@@ -64,6 +64,13 @@ STALE_SYNCING_GRACE_SECONDS = 30.0
 INTERRUPTED_SYNCING_MESSAGE = "上次索引同步中断，未发现正在运行的重建任务；请手动重建索引"
 GENERATION_RETENTION_HOURS = 24
 GENERATION_CLEANUP_CHUNK_SIZE = 5000
+# 构建线程每 N 秒刷新一次 building generation 的 updated_at，作为「仍然存活」的心跳。
+BUILDING_GENERATION_HEARTBEAT_SECONDS = 30.0
+# 心跳停滞超过该时长才认定是进程重启遗留的孤儿状态，避免误杀并发实例上仍在进行的重建。
+BUILDING_GENERATION_ORPHAN_GRACE_SECONDS = 300.0
+ORPHANED_BUILDING_GENERATION_MESSAGE = (
+    "上次索引重建被中断（进程重启），已自动回收重建标记，可重新重建"
+)
 
 
 @dataclass(slots=True)
@@ -231,6 +238,157 @@ class LibraryIndexService:
                 f"库存索引候选 generation 空间不足: free={available} required={required}"
             )
 
+    @staticmethod
+    def _generation_heartbeat_ms(db, library_id: str, generation: int) -> int:
+        """取候选 generation 的最近心跳时间（毫秒时间戳）。
+
+        只认 ``library_index_generations.updated_at``：这一行由构建线程独占，
+        而 status 行的 updated_at 会被 materializer 的租约/推进一起刷新，
+        拿它做存活依据会让孤儿构建永远看起来还活着。
+        """
+        candidate_updated_at = db.query(LibraryIndexGeneration.updated_at).filter(
+            LibraryIndexGeneration.library_id == library_id,
+            LibraryIndexGeneration.generation == generation,
+        ).scalar()
+        if candidate_updated_at is None:
+            return 0
+        try:
+            return int(candidate_updated_at.timestamp() * 1000)
+        except (AttributeError, OSError, OverflowError, ValueError):
+            return 0
+
+    def _building_generation_is_orphaned(
+        self,
+        library_id: str,
+        heartbeat_ms: int,
+        *,
+        grace_seconds: float = BUILDING_GENERATION_ORPHAN_GRACE_SECONDS,
+    ) -> bool:
+        """判断 building generation 是否已无人持有。
+
+        本进程仍在重建、或重建锁仍被占用时一律不判孤儿；其余情况要求心跳停滞
+        超过 ``grace_seconds``，避免把并发实例上正在进行的重建误判为遗留状态。
+        """
+        if self._has_running_rebuild_task(library_id):
+            return False
+        if self._get_lock(library_id).locked():
+            return False
+        if heartbeat_ms <= 0:
+            return True
+        return (time.time() - heartbeat_ms / 1000.0) >= float(grace_seconds)
+
+    def _mark_building_generation_orphaned(
+        self,
+        db,
+        library_id: str,
+        generation: int,
+        status: LibraryIndexStatus,
+        *,
+        reason: str,
+    ) -> None:
+        """在调用方事务内回收孤儿构建标记（不提交、不广播）。"""
+        now = get_local_now()
+        candidate = db.query(LibraryIndexGeneration).filter(
+            LibraryIndexGeneration.library_id == library_id,
+            LibraryIndexGeneration.generation == generation,
+        ).with_for_update().first()
+        if candidate is not None and str(candidate.state or "") == "building":
+            candidate.state = "failed"
+            candidate.error = ORPHANED_BUILDING_GENERATION_MESSAGE
+            candidate.retired_at = now
+            candidate.delete_after = now + timedelta(hours=GENERATION_RETENTION_HOURS)
+        status.building_generation = None
+        if str(status.status or "") == "syncing":
+            status.status = "ready" if status.active_generation else "error"
+        status.catchup_state = (
+            "catching_up"
+            if int(status.accepted_seq or 0) > int(status.materialized_seq or 0)
+            else "idle"
+        )
+        status.error = ORPHANED_BUILDING_GENERATION_MESSAGE
+        status.state_revision = int(status.state_revision or 0) + 1
+        status.updated_at = int(time.time() * 1000)
+        logger.warning(
+            "[索引] 回收中断的索引重建 library=%s generation=%s reason=%s",
+            library_id,
+            generation,
+            reason,
+        )
+
+    def recover_orphaned_building_generations(
+        self,
+        *,
+        grace_seconds: float = BUILDING_GENERATION_ORPHAN_GRACE_SECONDS,
+    ) -> list[dict[str, object]]:
+        """回收进程重启遗留的 building generation，让重建能重新开始。
+
+        重建标记只有「成功切代」和「捕获到异常」两条路径会清空；如果进程在重建
+        途中被重启，标记会永久残留，此后每次重建都会报「当前库存已有 building
+        generation」，库存索引刷新彻底停摆。这里按心跳判定孤儿并清空。
+        """
+        db = None
+        try:
+            db = SessionLocal()
+            library_ids = [
+                str(row[0])
+                for row in db.query(LibraryIndexStatus.library_id).filter(
+                    LibraryIndexStatus.building_generation.isnot(None),
+                ).order_by(LibraryIndexStatus.library_id.asc()).all()
+            ]
+        except Exception:
+            logger.warning("[索引] 扫描中断的索引重建失败", exc_info=True)
+            return []
+        finally:
+            if db is not None:
+                db.close()
+
+        recovered: list[dict[str, object]] = []
+        for library_id in library_ids:
+            db = SessionLocal()
+            try:
+                status = db.query(LibraryIndexStatus).filter(
+                    LibraryIndexStatus.library_id == library_id,
+                ).with_for_update().first()
+                if status is None or status.building_generation is None:
+                    db.rollback()
+                    continue
+                generation = int(status.building_generation)
+                heartbeat_ms = self._generation_heartbeat_ms(db, library_id, generation)
+                if not self._building_generation_is_orphaned(
+                    library_id,
+                    heartbeat_ms,
+                    grace_seconds=grace_seconds,
+                ):
+                    db.rollback()
+                    continue
+                self._mark_building_generation_orphaned(
+                    db,
+                    library_id,
+                    generation,
+                    status,
+                    reason="startup_recovery",
+                )
+                db.commit()
+                recovered.append({"library_id": library_id, "generation": generation})
+            except Exception:
+                db.rollback()
+                logger.warning(
+                    "[索引] 回收中断的索引重建失败 library=%s",
+                    library_id,
+                    exc_info=True,
+                )
+            finally:
+                db.close()
+
+        for item in recovered:
+            snapshot = self._store.get_status(str(item["library_id"]))
+            if snapshot is not None:
+                self._store._broadcast_status_change(
+                    snapshot,
+                    reason="library_index_generation_orphan_recovered",
+                )
+        return recovered
+
     def _create_building_generation(self, library_id: str, root_path: str) -> tuple[int, int]:
         if not self._generation_contract_enabled():
             raise RuntimeError(
@@ -259,7 +417,22 @@ class LibraryIndexService:
                 db.add(status)
                 db.flush()
             if status.building_generation is not None:
-                raise RuntimeError("当前库存已有 building generation")
+                occupied_generation = int(status.building_generation)
+                heartbeat_ms = self._generation_heartbeat_ms(
+                    db,
+                    library_id,
+                    occupied_generation,
+                )
+                if not self._building_generation_is_orphaned(library_id, heartbeat_ms):
+                    raise RuntimeError("当前库存已有 building generation")
+                # 进程重启遗留的标记会永久卡住重建：这里就地回收后继续本次重建。
+                self._mark_building_generation_orphaned(
+                    db,
+                    library_id,
+                    occupied_generation,
+                    status,
+                    reason="rebuild_requested",
+                )
             prepared_exists = db.query(LibraryIndexMutationOperation.operation_id).join(
                 LibraryIndexPendingMask,
                 LibraryIndexPendingMask.operation_id == LibraryIndexMutationOperation.operation_id,
@@ -286,6 +459,7 @@ class LibraryIndexService:
             status.building_generation = generation
             status.status = "syncing"
             status.catchup_state = "rebuilding"
+            status.error = None
             status.state_revision = int(status.state_revision or 0) + 1
             status.updated_at = int(time.time() * 1000)
             db.commit()
@@ -295,6 +469,38 @@ class LibraryIndexService:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def _touch_building_generation(library_id: str, generation: int) -> None:
+        """刷新 building generation 心跳。
+
+        顺带做一次 fencing：候选代已不在 building 状态（标记被回收或被别人接手）
+        时抛错终止，不再继续往一个已废弃的候选代里写数据。
+        """
+        db = SessionLocal()
+        try:
+            updated = db.query(LibraryIndexGeneration).filter(
+                LibraryIndexGeneration.library_id == library_id,
+                LibraryIndexGeneration.generation == generation,
+                LibraryIndexGeneration.state == "building",
+            ).update(
+                {LibraryIndexGeneration.updated_at: get_local_now()},
+                synchronize_session=False,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "[索引] 重建心跳写入失败 library=%s generation=%s",
+                library_id,
+                generation,
+                exc_info=True,
+            )
+            return
+        finally:
+            db.close()
+        if not updated:
+            raise RuntimeError("building generation 已被回收，重建终止")
 
     def _scan_building_generation(
         self,
@@ -309,6 +515,7 @@ class LibraryIndexService:
         written = 0
         total_size = 0
         folder_count = 0
+        last_heartbeat = time.monotonic()
         for entry in scanner.scan(library_id, root_path):
             entry.generation = generation
             entry.materialized_seq = build_base_seq
@@ -325,6 +532,17 @@ class LibraryIndexService:
                     relaxed_commit=True,
                 )
                 buffer.clear()
+                if time.monotonic() - last_heartbeat >= BUILDING_GENERATION_HEARTBEAT_SECONDS:
+                    self._touch_building_generation(library_id, generation)
+                    last_heartbeat = time.monotonic()
+            elif (
+                len(buffer) % 512 == 0
+                and time.monotonic() - last_heartbeat >= BUILDING_GENERATION_HEARTBEAT_SECONDS
+            ):
+                # 分卷很慢时可能很久填不满一个 chunk，这里按条数补心跳，
+                # 保证孤儿判定始终有 5 分钟内的存活依据。
+                self._touch_building_generation(library_id, generation)
+                last_heartbeat = time.monotonic()
         if buffer:
             written += self._store.bulk_upsert(
                 buffer,
@@ -630,6 +848,8 @@ class LibraryIndexService:
                 chunk_size,
             )
             while True:
+                # reconcile 单轮可能扫很久，心跳放在轮首保证孤儿判定有实时依据。
+                self._touch_building_generation(library_id, generation)
                 db = SessionLocal()
                 try:
                     accepted_seq = int(db.query(LibraryIndexStatus.accepted_seq).filter(
