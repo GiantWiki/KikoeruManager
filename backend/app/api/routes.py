@@ -8715,7 +8715,29 @@ async def resolve_conflict(conflict_id: str, action: dict):
                 
                 metadata = await metadata_service.fetch(extracted_path, task)
                 task.task_metadata = metadata
-                
+
+                # 元数据没抓到就不能继续：拿 minimal 去改名入库只会在库存里留下
+                # "[RJxxxx]" 半成品，原压缩包还会被归档。停在原地，让用户修好网络后重试。
+                from ..core.metadata_service import metadata_unavailable_reason as _metadata_unavailable_reason
+
+                metadata_skip_reason = _metadata_unavailable_reason(metadata)
+                if metadata_skip_reason:
+                    abort_reason = f"元数据获取失败，未改名、未入库：{metadata_skip_reason}"
+                    logger.warning("问题作品处理停止：%s", abort_reason)
+                    # 这个 task 可能被上面改成了 PROCESSING 却从未入队；不置终态会永远挂在进行中。
+                    try:
+                        task.fail(abort_reason)
+                    except Exception:
+                        logger.warning("问题作品处理停止后标记任务失败态出错", exc_info=True)
+                    try:
+                        await engine._cleanup_task_temp_extract_path(task)
+                    except Exception:
+                        logger.warning("问题作品处理停止后清理临时解压目录失败", exc_info=True)
+                    return {
+                        "success": False,
+                        "error": abort_reason,
+                    }
+
                 task.update_progress(60, "重命名文件夹")
                 from app.core.rename_service import RenameService
                 rename_service = RenameService()
@@ -8830,6 +8852,26 @@ async def resolve_conflict(conflict_id: str, action: dict):
                 extracted_path = await extract_service.extract(task)
                 if extracted_path:
                     metadata = await metadata_service.fetch(extracted_path, task)
+
+                    # 合并会在完成后删除原压缩包，元数据降级时绝不能走到那一步。
+                    from ..core.metadata_service import metadata_unavailable_reason as _metadata_unavailable_reason
+
+                    metadata_skip_reason = _metadata_unavailable_reason(metadata)
+                    if metadata_skip_reason:
+                        abort_reason = (
+                            "元数据获取失败，已停止合并（未改名、未移动、原压缩包保留）："
+                            f"{metadata_skip_reason}"
+                        )
+                        logger.warning("问题作品合并停止：%s", abort_reason)
+                        try:
+                            task.fail(abort_reason)
+                        except Exception:
+                            logger.warning("合并停止后标记任务失败态出错", exc_info=True)
+                        try:
+                            await engine._cleanup_task_temp_extract_path(task)
+                        except Exception:
+                            logger.warning("合并停止后清理临时解压目录失败", exc_info=True)
+                        raise HTTPException(status_code=409, detail=abort_reason)
 
                     # 重命名
                     from app.core.rename_service import RenameService
