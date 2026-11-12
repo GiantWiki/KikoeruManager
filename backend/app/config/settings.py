@@ -213,7 +213,6 @@ class MetadataConfig(BaseModel):
     fetch_cover: bool = True
     make_folder_icon: bool = True
     remove_jpg_file: bool = True
-    voicehub_enabled: bool = True  # 启用 voicehub.top 作为备用元数据源
 
 class RenameConfig(BaseModel):
     """重命名配置"""
