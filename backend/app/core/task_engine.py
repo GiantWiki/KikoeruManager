@@ -3589,28 +3589,25 @@ class TaskEngine:
                     }
                     self._sync_task_rjcode(task, metadata.get('rjcode'), source='task_fallback')
 
-                # 元数据是降级兜底（DLsite 不可达 / 短熔断）时不能在此时重命名：
-                # minimal 的 work_name 只是从解压临时目录名猜出来的，写进库存就成了
-                # "[RJ01586348][2_2(RJ...)_<task_id8>_<随机串>]"。断网时不降级命名，
-                # 停在重命名前等人工重试；重试会复用已解压产物继续这一段的后续步骤。
-                # 只在启用了重命名时拦截——关掉重命名时目录名不依赖元数据。
-                if (
-                    config.auto_process.rename
-                    and str(metadata.get("metadata_source") or "").strip().lower() == "minimal"
-                ):
-                    dlsite_network_error = self._dlsite_transport_failure_reason()
-                    if dlsite_network_error:
-                        logger.warning(
-                            f"[{rjcode}] DLsite 元数据网络不可达，暂停在重命名前等待人工重试: "
-                            f"{dlsite_network_error}"
-                        )
-                        self._mark_dlsite_network_paused(
-                            task,
-                            dlsite_network_error,
-                            paused_stage="pre_rename",
-                            resume_path=extracted_path,
-                        )
-                        return
+                # 元数据没真正抓到（网络失败 / 短熔断 / 作品不存在）就绝不允许继续：
+                # 用降级元数据改名只能得到 "[RJ01685546]" 这种半成品，入库后还得人工救，
+                # 分类也会拿不到 tags/maker 而落到默认桶。正确做法是停在重命名前，
+                # 产物留在解压临时目录，任务转「等待人工」，用户确认后点重试复用产物续跑
+                # （见 _prepare_pre_rename_resume）。只有真正抓到元数据才继续下一步。
+                metadata_unavailable = self._metadata_unavailable_reason(metadata)
+                if config.auto_process.fetch_metadata and metadata_unavailable:
+                    logger.warning(
+                        "[%s] 元数据未成功获取，停止后续流程等待人工重试: %s",
+                        rjcode,
+                        metadata_unavailable,
+                    )
+                    self._mark_metadata_unavailable_paused(
+                        task,
+                        metadata_unavailable,
+                        paused_stage="pre_rename",
+                        resume_path=extracted_path,
+                    )
+                    return
 
                 await task.wait_if_paused()
                 if task.is_cancelled():
@@ -3775,13 +3772,18 @@ class TaskEngine:
                     # DLsite 断网时元数据是「残缺但看起来正常」的（HTTP 层失败一律返回
                     # None，关联链退化成只有自己），此时归档入库会写入缺元数据的记录。
                     # 直接暂停为等待人工：网络断着自动重试没有意义，等用户确认后重试续跑。
+                    metadata_unavailable = self._metadata_unavailable_reason(
+                        dict(task.task_metadata or {})
+                    )
                     dlsite_network_error = self._dlsite_transport_failure_reason()
-                    if dlsite_network_error:
+                    if metadata_unavailable or dlsite_network_error:
+                        pause_reason = metadata_unavailable or f"DLsite 网络不可达: {dlsite_network_error}"
                         logger.warning(
-                            f"[{rjcode}] DLsite 元数据网络不可达，暂停归档等待人工重试: "
-                            f"{dlsite_network_error}"
+                            "[%s] 元数据不可用，暂停归档等待人工重试: %s",
+                            rjcode,
+                            pause_reason,
                         )
-                        self._mark_dlsite_network_paused(task, dlsite_network_error)
+                        self._mark_metadata_unavailable_paused(task, pause_reason)
                         return
                     task.update_progress(95, "归档压缩包")
                     await self._archive_source_file(task)
@@ -3945,6 +3947,21 @@ class TaskEngine:
                     metadata = dict(task.task_metadata or {})
                     task.update_progress(45, "准备重新重命名")
                     logger.info(f"[{rjcode}] 从重命名失败断点继续，复用已获取元数据")
+                    # 断点里若留着历史降级元数据（旧版本降级留下的），不能直接复用去改名。
+                    if self._metadata_unavailable_reason(metadata):
+                        if config.process_existing.fetch_metadata:
+                            logger.warning(
+                                f"[{rjcode}] 断点元数据为降级兜底，重新抓取后再决定是否重命名"
+                            )
+                            metadata = await metadata_service.fetch(extracted_path, task)
+                            task.task_metadata = {
+                                **(task.task_metadata or {}),
+                                **metadata,
+                            }
+                        else:
+                            raise RuntimeError(
+                                "断点元数据为降级兜底且未启用元数据抓取，已停止处理（未改名）"
+                            )
                 elif config.process_existing.fetch_metadata:
                     task.update_progress(30, "获取元数据")
                     metadata = await metadata_service.fetch(extracted_path, task)
@@ -3966,6 +3983,17 @@ class TaskEngine:
                         **metadata,
                     }
                     self._sync_task_rjcode(task, metadata.get('rjcode'), source='task_fallback')
+
+                # 已存在文件夹的处理同样不允许降级继续：拿不到元数据就改名入库，
+                # 只会把原目录名换成 "[RJxxxx]"，比不动它更糟。直接失败并写问题作品，
+                # 用户修好网络后重试即可（源目录不会被清理）。
+                if config.process_existing.fetch_metadata or resume_from_rename:
+                    metadata_unavailable = self._metadata_unavailable_reason(metadata)
+                    if metadata_unavailable:
+                        raise RuntimeError(
+                            "元数据获取失败，已停止处理（未改名、未入库）："
+                            f"{metadata_unavailable}"
+                        )
 
                 await task.wait_if_paused()
                 if task.is_cancelled():
@@ -4458,6 +4486,23 @@ class TaskEngine:
         self._remove_waiting_retry_task(task.rjcode)
 
     @staticmethod
+    def _metadata_unavailable_reason(metadata: Dict[str, Any]) -> str:
+        """元数据是否为降级兜底（空串代表真正抓到，可以继续）。"""
+        try:
+            from .metadata_service import metadata_unavailable_reason
+
+            return metadata_unavailable_reason(metadata)
+        except Exception:
+            # 兜底判断也不能放行 minimal，否则这个守卫会在异常时静默失效。
+            logger.warning("判断元数据可用性失败，按 metadata_source 兜底判断", exc_info=True)
+            source = (
+                str((metadata or {}).get("metadata_source") or "").strip().lower()
+                if isinstance(metadata, dict)
+                else ""
+            )
+            return "DLsite 元数据不可用（降级兜底）" if source == "minimal" else ""
+
+    @staticmethod
     def _dlsite_transport_failure_reason(within_seconds: float = 300.0) -> str:
         """本轮任务期间是否发生过 DLsite 传输类失败（DNS/连接/超时）。"""
         try:
@@ -4489,7 +4534,7 @@ class TaskEngine:
         except Exception as exc:
             reason = f"DLsite 元数据强制刷新异常: {exc}"
             logger.warning("[%s] %s；保留已有产物并继续等待人工", rjcode, reason)
-            self._mark_dlsite_network_paused(task, reason)
+            self._mark_metadata_unavailable_paused(task, reason)
             return
 
         metadata = dict(metadata or {})
@@ -4497,6 +4542,17 @@ class TaskEngine:
             **(task.task_metadata or {}),
             **metadata,
         }
+        # 重试后仍然只拿到降级元数据（网络没恢复 / 作品确实不存在）→ 继续等人工，
+        # 不能因为"重试过"就放行，否则又会把 [RJxxxx] 写进库存。
+        metadata_unavailable = self._metadata_unavailable_reason(metadata)
+        if metadata_unavailable:
+            logger.warning(
+                "[%s] 重试后元数据仍不可用，保留产物继续等待人工: %s",
+                rjcode,
+                metadata_unavailable,
+            )
+            self._mark_metadata_unavailable_paused(task, metadata_unavailable)
+            return
         effective_rjcode = self._get_effective_rjcode(task, output_path)
         if effective_rjcode:
             if not metadata.get("rjcode"):
@@ -4514,7 +4570,7 @@ class TaskEngine:
                 rjcode,
                 dlsite_network_error,
             )
-            self._mark_dlsite_network_paused(task, dlsite_network_error)
+            self._mark_metadata_unavailable_paused(task, dlsite_network_error)
             return
 
         next_metadata = dict(task.task_metadata or {})
@@ -4523,6 +4579,8 @@ class TaskEngine:
             "dlsite_network_paused",
             "dlsite_network_error",
             "dlsite_network_paused_stage",
+            "metadata_unavailable",
+            "metadata_unavailable_reason",
             "retry_exhausted",
             "retry_exhausted_at",
             "available_actions",
@@ -4634,7 +4692,7 @@ class TaskEngine:
             )
             return path
 
-    def _mark_dlsite_network_paused(
+    def _mark_metadata_unavailable_paused(
         self,
         task: Task,
         reason: str,
@@ -4642,10 +4700,11 @@ class TaskEngine:
         paused_stage: str = "pre_archive",
         resume_path: str = "",
     ) -> None:
-        """DLsite 元数据因网络/DNS 不可达时暂停任务，等用户确认网络后手动重试。
+        """元数据没抓到（网络 / 未找到 / 短熔断）时暂停任务，等用户确认后手动重试。
 
         形态与 ``_mark_dlsite_linkage_retry_exhausted`` 一致（写问题作品 + 等待人工 +
-        可用动作 RETRY/SKIP）；区别是根因在网络，重试前需要用户先确认链路恢复。
+        可用动作 RETRY/SKIP）；区别是不可能自动重试成功，必须由用户确认链路或数据
+        后再点重试。**绝不降级继续**：降级只会把 ``[RJxxxx]`` 半成品写进库存。
 
         ``paused_stage == "pre_rename"`` 表示产物还停在解压临时目录、尚未命名，
         重试时应当跳过解压直接复用该目录（见 ``_prepare_pre_rename_resume``）。
@@ -4659,6 +4718,8 @@ class TaskEngine:
             "dlsite_network_paused": True,
             "dlsite_network_error": str(reason or "")[:240],
             "dlsite_network_paused_stage": str(paused_stage or "pre_archive"),
+            "metadata_unavailable": True,
+            "metadata_unavailable_reason": str(reason or "")[:240],
         }
         normalized_resume_path = str(resume_path or "").strip()
         if normalized_resume_path:
@@ -4670,23 +4731,40 @@ class TaskEngine:
             self._record_problem_work_for_task_failure(task, task.rjcode, reason)
         except Exception:
             logger.warning(
-                "[%s] DLsite 网络失败写入问题作品失败", task.rjcode or "未知", exc_info=True
+                "[%s] 元数据失败写入问题作品失败", task.rjcode or "未知", exc_info=True
             )
         with task._set_state_silent():
             task.status = TaskStatus.WAITING_MANUAL
+            task.error_message = str(reason or "")[:500]
             if str(paused_stage or "").strip().lower() == "pre_rename":
                 task.current_step = (
-                    "等待人工: DLsite 元数据获取失败（网络/DNS），产物已解压但未命名，"
-                    "请确认网络或代理恢复后点重试继续"
+                    "等待人工: 元数据获取失败，产物已解压但未命名；"
+                    "确认网络/代理或作品链接正常后点重试继续"
                 )
             else:
                 task.current_step = (
-                    "等待人工: DLsite 元数据获取失败（网络/DNS），"
-                    "请确认网络或代理恢复正常后点重试继续"
+                    "等待人工: 元数据获取失败，产物已保留；"
+                    "确认网络/代理或作品链接正常后点重试继续"
                 )
             task.completed_at = datetime.now()
         task.mark_changed("status")
         self._remove_waiting_retry_task(task.rjcode)
+
+    def _mark_dlsite_network_paused(
+        self,
+        task: Task,
+        reason: str,
+        *,
+        paused_stage: str = "pre_archive",
+        resume_path: str = "",
+    ) -> None:
+        """兼容旧调用名：DLsite 网络不可达只是「元数据不可用」的一种。"""
+        self._mark_metadata_unavailable_paused(
+            task,
+            reason,
+            paused_stage=paused_stage,
+            resume_path=resume_path,
+        )
 
     @staticmethod
     def _dlsite_pause_is_pre_rename(task: Task) -> bool:
@@ -4709,6 +4787,8 @@ class TaskEngine:
             "dlsite_network_paused",
             "dlsite_network_error",
             "dlsite_network_paused_stage",
+            "metadata_unavailable",
+            "metadata_unavailable_reason",
             "retry_exhausted",
             "retry_exhausted_at",
             "available_actions",

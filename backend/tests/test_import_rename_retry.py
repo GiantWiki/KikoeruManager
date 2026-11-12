@@ -124,6 +124,7 @@ async def test_rename_retry_resumes_without_fetching_metadata(engine, tmp_path, 
             flatten_single_subfolder=False,
             remove_empty_folders=False,
         ),
+        filter=SimpleNamespace(file_dedup=False, rules=[]),
         asmr_sync=SimpleNamespace(simplify_chinese_enabled=False),
         storage=SimpleNamespace(asmr_subtitle_path=""),
     )
@@ -171,6 +172,83 @@ async def test_rename_retry_resumes_without_fetching_metadata(engine, tmp_path, 
     assert len(classify_calls) == 1
     assert classify_calls[0][1]["work_name"] == "断点重试作品"
     engine._archive_rename_retry_source.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_rename_retry_stops_when_refetched_metadata_is_still_minimal(engine, tmp_path, monkeypatch):
+    """重命名断点里的历史降级元数据不能直接复用：重抓仍失败就报错，不许改名。"""
+    extracted = tmp_path / "RJ01685546"
+    extracted.mkdir()
+    task = Task(
+        task_type=TaskType.PROCESS_EXISTING_FOLDER,
+        source_path=str(extracted),
+        auto_classify=True,
+        metadata={
+            "rjcode": "RJ01685546",
+            "metadata_source": "minimal",
+            "resume_from_stage": "rename",
+            "retry_from_conflicts": True,
+            "skip_duplicate_precheck": True,
+            "rename_retry_filter_enabled": False,
+            "rename_retry_classify_enabled": True,
+        },
+        rjcode="RJ01685546",
+    )
+    config = SimpleNamespace(
+        process_existing=SimpleNamespace(
+            check_duplicate=True,
+            fetch_metadata=True,
+            rename=True,
+            filter=False,
+            import_lrc=False,
+            classify=False,
+        ),
+        rename=SimpleNamespace(
+            flatten_single_subfolder=False,
+            remove_empty_folders=False,
+        ),
+        asmr_sync=SimpleNamespace(simplify_chinese_enabled=False),
+        storage=SimpleNamespace(asmr_subtitle_path=""),
+    )
+    monkeypatch.setattr(settings_module, "get_config", lambda: config)
+
+    fetch_calls = []
+
+    class FakeMetadataService:
+        async def fetch(self, *_args, **_kwargs):
+            fetch_calls.append(1)
+            return {
+                "rjcode": "RJ01685546",
+                "metadata_source": "minimal",
+                "rename_skipped_reason": "DLsite 连接失败，无法获取元数据",
+            }
+
+    class FakeRenameService:
+        async def rename(self, path, _task):
+            raise AssertionError("元数据没抓到就不能重命名")
+
+    monkeypatch.setattr("app.core.metadata_service.MetadataService", FakeMetadataService)
+    monkeypatch.setattr("app.core.rename_service.RenameService", FakeRenameService)
+    monkeypatch.setattr(engine, "_notify_progress", AsyncMock())
+    monkeypatch.setattr(engine, "_record_problem_work_for_task_failure", Mock())
+    monkeypatch.setattr(engine, "_resolve_retry_extract_conflict", Mock())
+    monkeypatch.setattr(engine, "_resolve_completed_failure_followups", Mock())
+    monkeypatch.setattr(engine, "_finalize_conflict_resolution_task", Mock())
+    monkeypatch.setattr(engine, "_cleanup_task_temp_extract_path", AsyncMock())
+    monkeypatch.setattr(engine, "_cleanup_failed_task", AsyncMock())
+    monkeypatch.setattr(engine, "persist_task_center_item_snapshot", Mock())
+    monkeypatch.setattr(
+        "app.core.circle_completion_service.get_circle_completion_service",
+        lambda: SimpleNamespace(sync_owned_for_rj=AsyncMock()),
+    )
+    monkeypatch.setattr("app.core.activity_log_service.log_task_lifecycle_event", Mock())
+    monkeypatch.setattr("app.core.task_notification_service.enqueue_notification_check", AsyncMock())
+
+    await engine._process_task(task)
+
+    assert fetch_calls == [1]
+    assert task.status == TaskStatus.FAILED
+    assert "元数据获取失败" in (task.error_message or "")
 
 
 @pytest.mark.asyncio
