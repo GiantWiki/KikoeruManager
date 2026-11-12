@@ -2,6 +2,17 @@
 
 本文件记录 KikoeruManager 的版本变化、功能更新与问题修复。更早的历史版本可通过 GitHub Tags 与提交历史查看。
 
+## v2.6.74（2026-11-12）
+
+### 修复
+- **元数据抓取失败不再「降级后继续」，一律停在等待人工重试**：v2.6.70 的守卫条件是「`metadata_source == "minimal"` 且最近 300 秒有 DLsite 传输失败」，但续跑入口 `_prepare_pre_rename_resume()` 一进来就清掉传输失败快照，紧接着短熔断打开后 product_info 链路直接返回 None 不再记录失败、requests 直连链路也不写快照——拿旁证替代事实，守卫自己把自己废掉。现场 RJ01685546 因此仍被命名成 `[RJ01685546]` 落进暂存库，任务还显示 100% 完成。现在判据只认事实：`metadata_service.metadata_unavailable_reason()` 只看 `metadata_source == "minimal"`；自动处理流程命中即 `WAITING_MANUAL` + 写问题作品 + `output_path` 指向解压临时目录 + `RETRY/SKIP`，点重试直接复用已解压产物、不重新解压；已存在文件夹处理（`_process_existing_task`）命中则抛错，源目录不动；归档前守卫再判一次，重试后仍是 minimal 也继续等待人工。
+- **问题作品「保留新版」「合并」两条写库分支同样中止**：两者都是取完元数据立即改名/移动，命中 minimal 直接停。合并分支尤其关键——它成功后会删除原压缩包，绝不能带着占位元数据走到那一步。
+- **移除 voicehub.top 备用元数据源**：该站 2026-09 起整体 301 到 `asmrdaily.drive2dav.top`，`/api/*` 改为登录鉴权（实测 401）；旧地址一个返回 HTML（JSON 解析失败）、一个跟跳转后读超时，每次失败白等 30–60 秒，还把「DLsite 连不上」伪装成「所有源都没有这部作品」，误导排障方向。现在只保留 DLsite 两条链路（product_info / 直连 product.json），失败直接返回 minimal 并由上层中止；`metadata.voicehub_enabled` 配置项一并删除（旧配置文件里残留该键会被忽略，不影响启动）。
+
+### 测试
+- 新增 `test_metadata_no_third_party_fallback.py` **2 项通过**：两条 DLsite 链路都失败后直接返回 minimal、不再发起第三方请求；`voicehub_enabled` 配置项已移除且旧配置不报错。
+- 回归：元数据链路、重命名、任务引擎、任务中心 **127 项通过**；1 failed（`test_get_task_engine_reserves_asmr_file_download_slots` 的并发槽位断言）+ 17 error（`--noconftest` 下缺 `db_session`/`db_engine` 夹具）均为改动前基线。
+
 ## v2.6.73（2026-11-09）
 
 ### 修复
